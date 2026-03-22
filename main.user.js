@@ -35,6 +35,12 @@
         #start-button { padding: 10px 15px; background-color: #198754; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; transition: background-color 0.3s; }
         #start-button:hover { background-color: #157347; }
         #status-log { margin-top: 15px; padding: 10px; background-color: #f8f9fa; border-radius: 4px; height: 100px; overflow-y: auto; font-size: 12px; color: #555; border: 1px solid #e0e0e0; }
+        .setting-group { font-size: 13px; margin-bottom: 5px; }
+        .setting-group label { display: block; margin-bottom: 4px; color: #333; }
+        .setting-group input, .setting-group select { width: 100%; box-sizing: border-box; padding: 6px; border: 1px solid #ccc; border-radius: 4px; }
+        .hidden { display: none !important; }
+        #save-settings { padding: 6px; background-color: #0dcaf0; color: #000; border: none; border-radius: 4px; cursor: pointer; }
+        #save-settings:hover { background-color: #31d2f2; }
     `);
 
     const panelHTML = `
@@ -43,6 +49,28 @@
             <div id="ai-panel">
                 <div id="panel-header">AI 自动答题设置 (拖拽这里)</div>
                 <div id="panel-content">
+                    <div class="setting-group">
+                        <label>AI 接口选择:</label>
+                        <select id="ai-provider">
+                            <option value="free">免费模型</option>
+                            <option value="custom">自定义</option>
+                        </select>
+                    </div>
+                    <div id="custom-ai-settings" class="hidden">
+                        <div class="setting-group">
+                            <label>Base URL:</label>
+                            <input type="text" id="ai-url" autocomplete="off" spellcheck="false">
+                        </div>
+                        <div class="setting-group">
+                            <label>API Key:</label>
+                            <input type="text" id="ai-key" autocomplete="new-password" spellcheck="false" style="-webkit-text-security: disc;">
+                        </div>
+                        <div class="setting-group">
+                            <label>Model:</label>
+                            <input type="text" id="ai-model" autocomplete="off" spellcheck="false">
+                        </div>
+                        <button id="save-settings">保存接口设置</button>
+                    </div>
                     <button id="start-button">开始自动答题</button>
                     <div id="status-log">状态日志...</div>
                 </div>
@@ -56,9 +84,73 @@
     const toggleButton = document.getElementById('panel-toggle');
     const startButton = document.getElementById('start-button');
     const statusLog = document.getElementById('status-log');
+    
+    // 自定义AI设置相关的元素
+    const providerSelect = document.getElementById('ai-provider');
+    const customSettingsDiv = document.getElementById('custom-ai-settings');
+    const apiUrlInput = document.getElementById('ai-url');
+    const apiKeyInput = document.getElementById('ai-key');
+    const apiModelInput = document.getElementById('ai-model');
+    const saveSettingsBtn = document.getElementById('save-settings');
 
-    let isPanelVisible = false;
+    let isPanelVisible = GM_getValue('panel_visible_state', true); // 默认开启
     let autoMode = GM_getValue('autoMode_state', false);
+
+    // 初始化面板可见性
+    if (isPanelVisible) {
+        panel.classList.add('show');
+        toggleButton.textContent = 'X';
+    } else {
+        panel.classList.remove('show');
+        toggleButton.textContent = 'AI';
+    }
+    
+    // 读取持久化的AI设置
+    let savedProvider = GM_getValue('ai_provider', 'free');
+    let savedApiUrl = GM_getValue('ai_url', '');
+    let savedApiKey = GM_getValue('ai_key', '');
+    let savedApiModel = GM_getValue('ai_model', '');
+
+    // 初始化UI状态
+    providerSelect.value = savedProvider;
+    apiUrlInput.value = savedApiUrl;
+    apiKeyInput.value = savedApiKey;
+    apiModelInput.value = savedApiModel;
+    if (savedProvider === 'custom') {
+        customSettingsDiv.classList.remove('hidden');
+    }
+
+    // 监听切换和保存事件
+    providerSelect.addEventListener('change', (e) => {
+        savedProvider = e.target.value;
+        GM_setValue('ai_provider', savedProvider); // 切换时直接保存模式
+        
+        if (savedProvider === 'custom') {
+            customSettingsDiv.classList.remove('hidden');
+            log("已切换至 自定义模式。请确保下方配置正确并点击保存。");
+        } else {
+            customSettingsDiv.classList.add('hidden');
+            log("已切换至 免费模型。直接点击开始答题即可。");
+        }
+    });
+
+    saveSettingsBtn.addEventListener('click', () => {
+        savedApiUrl = apiUrlInput.value.trim();
+        savedApiKey = apiKeyInput.value.trim();
+        savedApiModel = apiModelInput.value.trim();
+        
+        // 自动补全 /chat/completions
+        if (savedApiUrl && !savedApiUrl.endsWith('/chat/completions')) {
+            savedApiUrl = savedApiUrl.replace(/\/+$/, '') + '/chat/completions';
+            apiUrlInput.value = savedApiUrl; // 更新UI显示
+        }
+        
+        GM_setValue('ai_url', savedApiUrl);
+        GM_setValue('ai_key', savedApiKey);
+        GM_setValue('ai_model', savedApiModel);
+        
+        log(`自定义接口设置已保存!`);
+    });
 
     // --- 3. UI交互与拖拽逻辑 ---
     const dragContainer = document.getElementById('ai-drag-container');
@@ -153,11 +245,32 @@
             const prompt = `你是一个专业的在线课程答题助手。请根据以下题目和选项，直接给出正确答案。规则：1. **${type === '多选题' ? '这是一个多选题，答案可能有多个。' : '这是一个' + type + '。'}** 2. **如果是选择题或判断题，直接返回代表正确选项的字母。** 3. **如果是填空题，直接返回填空内容。如果有多个空，必须使用 "||" 分隔各个空的答案。** 4. **不要包含任何其他解释、标点符号或文字。** - 例如：如果选择题答案是A，就返回 "A"。- 如果是填空题答案是“苹果”和“香蕉”，就返回 "苹果||香蕉"。---题目: ${question}---选项:${options.map((opt, index) => `${String.fromCharCode(65 + index)}. ${opt}`).join('\n')}---你的答案:`;
             const messages = [{ "role": "user", "content": prompt }];
 
-            const url = "https://api.coren.xin/zhipu-free-proxy";
-            const headers = { "Content-Type": "application/json" };
-            const data = JSON.stringify({ messages: messages });
+            let url, headers, data;
 
-            log("正在请求AI回答 (GLM-4.5-Flash)...");
+            if (savedProvider === 'custom') {
+                if (!savedApiUrl || !savedApiKey || !savedApiModel) {
+                    log("错误：自定义AI接口的URL、Key或Model为空，请在面板中设置并保存。");
+                    resolve(null);
+                    return;
+                }
+                url = savedApiUrl;
+                headers = { 
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${savedApiKey}`
+                };
+                data = JSON.stringify({ 
+                    model: savedApiModel,
+                    messages: messages,
+                    temperature: 0.1
+                });
+                log(`正在请求AI回答 (${savedApiModel})...`);
+            } else {
+                url = "https://api.coren.xin/zhipu-free-proxy";
+                headers = { "Content-Type": "application/json" };
+                data = JSON.stringify({ messages: messages });
+                log("正在请求AI回答 (免费模型 GLM-4.5-Flash)...");
+            }
+
             GM_xmlhttpRequest({
                 method: "POST",
                 url: url,
