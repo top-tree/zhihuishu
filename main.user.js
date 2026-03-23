@@ -27,7 +27,15 @@
         #panel-content { padding: 20px; display: flex; flex-direction: column; gap: 15px; }
         #start-button { padding: 10px 15px; background-color: #198754; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; transition: background-color 0.3s; }
         #start-button:hover { background-color: #157347; }
-        #status-log { margin-top: 15px; padding: 10px; background-color: #f8f9fa; border-radius: 4px; height: 100px; overflow-y: auto; font-size: 12px; color: #555; border: 1px solid #e0e0e0; }
+        #status-log { margin-top: 15px; padding: 10px; background-color: #f8f9fa; border-radius: 6px; height: 140px; overflow-y: auto; font-size: 12px; color: #495057; border: 1px solid #dee2e6; box-shadow: inset 0 1px 3px rgba(0,0,0,0.04); }
+        #status-log div { margin-bottom: 6px; line-height: 1.4; word-break: break-all; border-bottom: 1px dashed #f1f3f5; padding-bottom: 4px; }
+        #status-log div:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
+        #status-log .time { color: #adb5bd; margin-right: 6px; font-family: monospace; font-size: 11px; }
+        #status-log .level { display: inline-block; min-width: 50px; font-family: monospace; margin-right: 4px; }
+        #status-log .log-debug .level { color: #6c757d; }
+        #status-log .log-info .level { color: #0d6efd; }
+        #status-log .log-warn .level { color: #fd7e14; }
+        #status-log .log-error .level { color: #dc3545; }
         .setting-group { font-size: 13px; margin-bottom: 5px; }
         .setting-group label { display: block; margin-bottom: 4px; color: #333; }
         .setting-group input, .setting-group select { width: 100%; box-sizing: border-box; padding: 6px; border: 1px solid #ccc; border-radius: 4px; }
@@ -77,6 +85,8 @@
     const toggleButton = document.getElementById('panel-toggle');
     const startButton = document.getElementById('start-button');
     const statusLog = document.getElementById('status-log');
+    const LOG_BUFFER_KEY = 'runtime_log_buffer_v1';
+    const LOG_BUFFER_MAX = 300;
     
     // 自定义AI设置相关的元素
     const providerSelect = document.getElementById('ai-provider');
@@ -220,11 +230,83 @@
     startButton.addEventListener('click', () => toggleAutoMode(!autoMode));
 
     // --- 4. 核心功能函数 ---
-    function log(message) {
-        console.log(`[AI脚本] ${message}`);
-        const timestamp = new Date().toLocaleTimeString();
-        statusLog.innerHTML += `<div>${timestamp}: ${message}</div>`;
+    function getLogBuffer() {
+        const value = GM_getValue(LOG_BUFFER_KEY, []);
+        if (Array.isArray(value)) return value;
+        try {
+            const parsed = JSON.parse(value || '[]');
+            return Array.isArray(parsed) ? parsed : [];
+        } catch (e) {
+            return [];
+        }
+    }
+
+    function saveLogBuffer(buffer) {
+        GM_setValue(LOG_BUFFER_KEY, buffer.slice(-LOG_BUFFER_MAX));
+    }
+
+    function clearLogBuffer() {
+        GM_setValue(LOG_BUFFER_KEY, []);
+        statusLog.innerHTML = '';
+    }
+
+    function renderLogEntry(entry) {
+        const safeLevel = String(entry.level || 'info').toLowerCase();
+        const safeTag = safeLevel.toUpperCase();
+        const safeTime = entry.time || new Date().toLocaleTimeString();
+        const safeMsg = String(entry.message || '');
+        statusLog.innerHTML += `<div class="log-${safeLevel}"><span class="time">[${safeTime}]</span><span class="level">[${safeTag}]</span>${safeMsg}</div>`;
+    }
+
+    function renderLogBuffer() {
+        statusLog.innerHTML = '';
+        const buffer = getLogBuffer();
+        for (const entry of buffer) {
+            renderLogEntry(entry);
+        }
         statusLog.scrollTop = statusLog.scrollHeight;
+    }
+
+    function log(message, level = 'info') {
+        const lv = String(level || 'info').toLowerCase();
+        const levelTag = lv.toUpperCase();
+        console.log(`[AI脚本][${levelTag}] ${message}`);
+        const timestamp = new Date().toLocaleTimeString();
+
+        const entry = { time: timestamp, level: lv, message: message };
+        const buffer = getLogBuffer();
+        buffer.push(entry);
+        saveLogBuffer(buffer);
+
+        if (statusLog.childElementCount >= LOG_BUFFER_MAX) {
+            statusLog.removeChild(statusLog.firstElementChild);
+        }
+
+        renderLogEntry(entry);
+        statusLog.scrollTop = statusLog.scrollHeight;
+    }
+
+    function isElementVisible(el) {
+        if (!el) return false;
+        const style = getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    }
+
+    function findImproveButton() {
+        const selectors = ['.simplified-mastery__action', '.improve-btn', 'button', '.el-button', '.van-button'];
+        for (const selector of selectors) {
+            const nodes = document.querySelectorAll(selector);
+            for (const node of nodes) {
+                const text = ((node.textContent || node.innerText || '').replace(/\s+/g, ''));
+                const disabled = !!node.disabled || node.getAttribute('aria-disabled') === 'true' || node.classList.contains('is-disabled');
+                if (text.includes('去提升') && isElementVisible(node) && !disabled) {
+                    return node;
+                }
+            }
+        }
+        return null;
     }
 
     function reliableClick(element) {
@@ -233,39 +315,322 @@
         element.dispatchEvent(clickEvent);
     }
 
-    function callAiApi(question, options, type) {
+    async function waitForElement(selector, timeout = 15000, interval = 500) {
+        const endTime = Date.now() + timeout;
+        while (Date.now() < endTime) {
+            const el = document.querySelector(selector);
+            if (el) return el;
+            await new Promise(resolve => setTimeout(resolve, interval));
+        }
+        return null;
+    }
+
+    const NO_IMPROVE_CACHE_KEY = 'no_improve_cache_v1';
+
+    function getNoImproveCache() {
+        const value = GM_getValue(NO_IMPROVE_CACHE_KEY, []);
+        if (Array.isArray(value)) return value;
+        try {
+            const parsed = JSON.parse(value || '[]');
+            return Array.isArray(parsed) ? parsed : [];
+        } catch (e) {
+            return [];
+        }
+    }
+
+    function addToNoImproveCache(itemName) {
+        if (!itemName) return;
+        const list = getNoImproveCache();
+        if (list.includes(itemName)) return;
+        list.push(itemName);
+        GM_setValue(NO_IMPROVE_CACHE_KEY, list);
+        log(`已加入永久缓存(无去提升): ${itemName}`);
+    }
+
+    function getCurrentLearnItemName() {
+        const node = document.querySelector('.title-text.active, .item-title.active, .section-item-collapse-info.active .title-text, .item-content.active .item-title');
+        if (!node) return '';
+        return (node.textContent || node.innerText || '').trim();
+    }
+
+    function goToCourseList(reason) {
+        if (reason) log(reason);
+        const courseUrl = sessionStorage.getItem('course_list_url');
+        if (courseUrl) {
+            log('返回课程主页(singleCourse)继续筛选...');
+            window.location.href = courseUrl;
+        } else {
+            log('未记录课程主页URL，请手动回到课程页。');
+        }
+    }
+
+    function getUnansweredQuestionItems() {
+        const selectors = [
+            '.answerCard .answer-item',
+            '.topic-list .topic-item',
+            '.card-list li',
+            '.answer-card li',
+            '.question-card li',
+            '.sheet-list li',
+            '.topic-card-item',
+            '.answer-sheet li'
+        ];
+
+        const rawNodes = [];
+        for (const selector of selectors) {
+            document.querySelectorAll(selector).forEach(node => rawNodes.push(node));
+        }
+
+        const nodes = Array.from(new Set(rawNodes));
+        const unansweredHints = ['unanswered', 'not-answer', 'notanswered', 'todo', 'undone', 'empty', 'unfinish', 'wait-answer', 'no-answer'];
+        const answeredHints = ['is-answered', 'answered', 'done', 'finish', 'completed'];
+
+        return nodes.filter(node => {
+            const cls = String(node.className || '').toLowerCase();
+            const text = String(node.textContent || '').replace(/\s+/g, '');
+
+            if (text.includes('未答') || text.includes('未做') || text.includes('空白')) return true;
+            if (unansweredHints.some(h => cls.includes(h))) return true;
+
+            if (node.matches('.answerCard .answer-item:not(.is-answered)')) return true;
+            if (node.matches('.topic-list .topic-item:not(.done)')) return true;
+
+            if (answeredHints.some(h => cls.includes(h))) return false;
+            return false;
+        });
+    }
+
+    function isLikelyCurrentCardItem(node) {
+        if (!node) return false;
+        const cls = String(node.className || '').toLowerCase();
+        return cls.includes('active') || cls.includes('current') || cls.includes('on') || cls.includes('selected');
+    }
+
+    function getUnansweredOutsideCurrentItems() {
+        return getUnansweredQuestionItems().filter(node => !isLikelyCurrentCardItem(node));
+    }
+
+    function jumpToFirstUnanswered(reason) {
+        const items = getUnansweredQuestionItems();
+        if (items.length === 0) return false;
+        log(`${reason} 找到 ${items.length} 个未作答题目，跳转到第一个...`, 'warn');
+        reliableClick(items[0]);
+        return true;
+    }
+
+    function getTestRuntimeState() {
+        if (!unsafeWindow.__aiTestRuntimeState) {
+            unsafeWindow.__aiTestRuntimeState = {
+                pendingQuestions: {},
+                attemptedQuestions: {}
+            };
+        }
+        return unsafeWindow.__aiTestRuntimeState;
+    }
+
+    function markQuestionPending(questionKey, reason = '') {
+        if (!questionKey) return;
+        const state = getTestRuntimeState();
+        const alreadyPending = !!state.pendingQuestions[questionKey];
+        state.pendingQuestions[questionKey] = Date.now();
+        if (reason && !alreadyPending) {
+            log(`题目待补答: ${reason}`, 'warn');
+        }
+    }
+
+    function clearQuestionPending(questionKey) {
+        if (!questionKey) return;
+        const state = getTestRuntimeState();
+        if (state.pendingQuestions[questionKey]) {
+            delete state.pendingQuestions[questionKey];
+        }
+    }
+
+    function getPendingQuestionCount() {
+        const state = getTestRuntimeState();
+        return Object.keys(state.pendingQuestions).length;
+    }
+
+    function markQuestionAttempted(questionKey) {
+        if (!questionKey) return;
+        const state = getTestRuntimeState();
+        state.attemptedQuestions[questionKey] = Date.now();
+    }
+
+    function hasQuestionAttempted(questionKey) {
+        if (!questionKey) return false;
+        const state = getTestRuntimeState();
+        return !!state.attemptedQuestions[questionKey];
+    }
+
+    function clearAllPendingQuestions(reason = '') {
+        const state = getTestRuntimeState();
+        const count = Object.keys(state.pendingQuestions).length;
+        state.pendingQuestions = {};
+        if (reason && count > 0) {
+            log(`${reason}（已清理 ${count} 条待补答记录）`, 'debug');
+        }
+    }
+
+    function reconcilePendingQuestionsWithDom() {
+        const pendingCount = getPendingQuestionCount();
+        if (pendingCount === 0) return 0;
+
+        const domHasUnansweredOutsideCurrent = getUnansweredOutsideCurrentItems().length > 0;
+        if (!domHasUnansweredOutsideCurrent) {
+            clearAllPendingQuestions('页面未检测到漏题，待补答清单疑似历史残留，自动清理');
+            return 0;
+        }
+        return pendingCount;
+    }
+
+    function jumpToFirstQuestionCard(reason) {
+        const first = document.querySelector('.answerCard .answer-item, .topic-list .topic-item, .card-list li, .answer-card li, .question-card li, .sheet-list li, .answer-sheet li');
+        if (!first) return false;
+        log(reason, 'warn');
+        reliableClick(first);
+        return true;
+    }
+
+    function isQuestionAnswered(qContent) {
+        if (!qContent) return false;
+
+        const fillInputs = qContent.querySelectorAll('.input-ques .fillAnswer input.el-input__inner, .input-ques .fillAnswer textarea.el-textarea__inner, input[type="text"], textarea');
+        if (fillInputs.length > 0) {
+            for (const input of fillInputs) {
+                if (!input.value || input.value.trim() === '') return false;
+            }
+            return true;
+        }
+
+        const checkedOptions = qContent.querySelectorAll('.is-checked, input[type="radio"]:checked, input[type="checkbox"]:checked');
+        if (checkedOptions.length > 0) return true;
+
+        return false;
+    }
+
+    function hasCurrentQuestionUnanswered() {
+        const qContent = document.querySelector('.questionContent');
+        if (!qContent) return false;
+        return !isQuestionAnswered(qContent);
+    }
+
+    function normalizeFullWidthLetters(text) {
+        return String(text || '').replace(/[Ａ-Ｚ]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 65248));
+    }
+
+    function normalizeTextForMatch(text) {
+        return String(text || '')
+            .toLowerCase()
+            .replace(/\s+/g, '')
+            .replace(/[，。、“”‘’【】（）()《》：:；;,.!?！？'"`]/g, '');
+    }
+
+    function parseChoiceAnswer(rawContent, options, type) {
+        let text = normalizeFullWidthLetters(rawContent).trim();
+
+        if (type.includes('判断')) {
+            if (/对|正确|\btrue\b|\bT\b|√/i.test(text)) return 'A';
+            if (/错|错误|\bfalse\b|\bF\b|×/i.test(text)) return 'B';
+        }
+
+        let letters = text.toUpperCase().replace(/[^A-Z]/g, '');
+
+        if (!letters && options && options.length > 0) {
+            const normalizedReply = normalizeTextForMatch(text);
+            let matched = '';
+            options.forEach((opt, index) => {
+                const normOpt = normalizeTextForMatch(opt);
+                if (normOpt && normalizedReply.includes(normOpt)) {
+                    matched += String.fromCharCode(65 + index);
+                }
+            });
+            letters = matched;
+        }
+
+        const maxLetters = options ? options.length : 4;
+        const result = [];
+        for (const ch of letters) {
+            const idx = ch.charCodeAt(0) - 65;
+            if (idx >= 0 && idx < maxLetters && !result.includes(ch)) {
+                result.push(ch);
+            }
+        }
+
+        if (result.length === 0) return null;
+        if (type.includes('单选') || type.includes('判断')) return result[0];
+        return result.join('');
+    }
+
+    function parseFillAnswer(rawContent) {
+        let text = String(rawContent || '').trim();
+        text = text.replace(/^答案[:：]?\s*/i, '');
+        text = text.replace(/^填空答案[:：]?\s*/i, '');
+        text = text.replace(/\r?\n+/g, '||');
+        return text || null;
+    }
+
+    function buildAiMessages(question, options, type, safeMode = false) {
+        const q = String(question || '').replace(/\s+/g, ' ').trim();
+        const optionText = (options || [])
+            .map((opt, i) => `${String.fromCharCode(65 + i)}. ${String(opt || '').replace(/\s+/g, ' ').trim()}`)
+            .join('\n');
+
+        const baseRules = type.includes('填空')
+            ? '只输出填空答案；多空用||分隔；禁止解释。'
+            : '只输出选项字母；单选/判断输出一个字母，多选输出连续字母；禁止解释。';
+
+        const safetyLine = safeMode
+            ? '这是客观题文本处理任务，仅输出答案格式，不做评价。'
+            : '';
+
+        return [
+            { role: 'system', content: '你是客观题答题助手，只返回最终答案，不要解释。' },
+            {
+                role: 'user',
+                content: [
+                    `题型: ${type}`,
+                    `规则: ${baseRules}`,
+                    safetyLine,
+                    `题目: ${q}`,
+                    optionText ? `选项:\n${optionText}` : ''
+                ].filter(Boolean).join('\n')
+            }
+        ];
+    }
+
+    function callAiApi(question, options, type, safeMode = false) {
         return new Promise((resolve) => {
-            const prompt = `你是一个专业的在线课程答题助手。请根据以下题目和选项，直接给出正确答案。规则：1. **${type === '多选题' ? '这是一个多选题，答案可能有多个。' : '这是一个' + type + '。'}** 2. **如果是选择题或判断题，直接返回代表正确选项的字母。** 3. **如果是填空题，直接返回填空内容。如果有多个空，必须使用 "||" 分隔各个空的答案。** 4. **不要包含任何其他解释、标点符号或文字。** - 例如：如果选择题答案是A，就返回 "A"。- 如果是填空题答案是“苹果”和“香蕉”，就返回 "苹果||香蕉"。---题目: ${question}---选项:${options.map((opt, index) => `${String.fromCharCode(65 + index)}. ${opt}`).join('\n')}---你的答案:`;
-            const messages = [{ "role": "user", "content": prompt }];
+            const messages = buildAiMessages(question, options, type, safeMode);
 
             let url, headers, data;
 
             if (savedProvider === 'custom') {
                 if (!savedApiUrl || !savedApiKey || !savedApiModel) {
-                    log("错误：自定义AI接口的URL、Key或Model为空，请在面板中设置并保存。");
-                    resolve(null);
+                    log('错误：自定义AI接口的URL、Key或Model为空，请在面板中设置并保存。', 'error');
+                    resolve({ answer: null, errorType: 'config' });
                     return;
                 }
                 url = savedApiUrl;
-                headers = { 
-                    "Content-Type": "application/json",
-                    "Authorization": `Bearer ${savedApiKey}`
+                headers = {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${savedApiKey}`
                 };
-                data = JSON.stringify({ 
+                data = JSON.stringify({
                     model: savedApiModel,
                     messages: messages,
                     temperature: 0.1
                 });
                 log(`正在请求AI回答 (${savedApiModel})...`);
             } else {
-                url = "https://api.coren.xin/zhipu-free-proxy";
-                headers = { "Content-Type": "application/json" };
+                url = 'https://api.coren.xin/zhipu-free-proxy';
+                headers = { 'Content-Type': 'application/json' };
                 data = JSON.stringify({ messages: messages });
-                log("正在请求AI回答 (免费模型 GLM-4.5-Flash)...");
+                log('正在请求AI回答 (免费模型 GLM-4.5-Flash)...');
             }
 
             GM_xmlhttpRequest({
-                method: "POST",
+                method: 'POST',
                 url: url,
                 headers: headers,
                 data: data,
@@ -275,198 +640,361 @@
                         try {
                             const responseData = JSON.parse(response.responseText);
                             const content = responseData.choices?.[0]?.message?.content;
-
-                            if (content !== null && content !== undefined) {
-                                let answer = content.trim();
-                                if (type.includes("填空")) {
-                                    log(`AI 填空题回答: ${answer}`);
-                                    resolve(answer);
-                                    return;
-                                }
-                                
-                                // 处理判断题的中文回复
-                                let isTrueFalseText = false;
-                                if (type.includes('判断')) {
-                                    if (answer.includes('对') || answer.includes('正确') || answer.includes('T') || answer.includes('√')) {
-                                        answer = 'A';
-                                        isTrueFalseText = true;
-                                    } else if (answer.includes('错') || answer.includes('错误') || answer.includes('F') || answer.includes('×')) {
-                                        answer = 'B';
-                                        isTrueFalseText = true;
-                                    }
-                                }
-                                
-                                if (!isTrueFalseText) {
-                                    answer = answer.toUpperCase().replace(/[^A-Z]/g, '');
-                                }
-                                
-                                log(`AI 回答: ${answer}`);
-                                resolve(answer);
-
-                            } else {
-                                log(`API 返回错误: ${responseData.message || '内容为空'}`);
-                                resolve(null);
+                            if (content === null || content === undefined) {
+                                log(`API 返回错误: ${responseData.message || '内容为空'}`, 'warn');
+                                resolve({ answer: null, errorType: 'empty' });
+                                return;
                             }
+
+                            let parsedAnswer = null;
+                            if (type.includes('填空')) {
+                                parsedAnswer = parseFillAnswer(content);
+                                log(`AI 填空题回答: ${parsedAnswer || '(空)'}`);
+                            } else {
+                                parsedAnswer = parseChoiceAnswer(content, options, type);
+                                log(`AI 回答: ${parsedAnswer || '(无法解析)'}`);
+                            }
+
+                            resolve({ answer: parsedAnswer, errorType: parsedAnswer ? null : 'parse' });
                         } catch (e) {
-                            log(`解析API响应失败: ${e.message}`);
-                            resolve(null);
+                            log(`解析API响应失败: ${e.message}`, 'warn');
+                            resolve({ answer: null, errorType: 'parse' });
                         }
                     } else {
-                        log(`API 请求失败: ${response.status} ${response.statusText}`);
-                        resolve(null);
+                        let errorMsg = response.statusText || '';
+                        try {
+                            const errorData = JSON.parse(response.responseText);
+                            errorMsg = errorData.error?.message || errorData.message || errorMsg;
+                        } catch (e) {}
+
+                        log(`API 请求失败: ${response.status} - ${errorMsg}`);
+
+                        let errorType = 'http';
+                        if (response.status === 429) errorType = 'rate_limit';
+                        if (response.status === 400 && /敏感|不安全|unsafe|sensitive/i.test(errorMsg)) errorType = 'sensitive';
+                        if (response.status >= 500) errorType = 'server';
+
+                        resolve({ answer: null, errorType: errorType });
                     }
                 },
-                onerror: (error) => { log(`API 调用出错: ${error.statusText || '网络错误'}`); resolve(null); },
-                ontimeout: () => { log(`API 请求超时 (15秒)。`); resolve(null); }
+                onerror: (error) => {
+                    log(`API 调用出错: ${error.statusText || '网络错误'}`);
+                    resolve({ answer: null, errorType: 'network' });
+                },
+                ontimeout: () => {
+                    log('API 请求超时 (15秒)。');
+                    resolve({ answer: null, errorType: 'timeout' });
+                }
             });
         });
     }
 
     // --- 总的答案获取调度函数 ---
     async function getAnswer(question, options, type, retries = 3) {
+        let safeMode = false;
         for (let i = 0; i < retries; i++) {
-            const ans = await callAiApi(question, options, type);
-            if (ans) return ans;
-            log(`AI 第 ${i + 1} 次尝试失败，准备重试...`);
-            await new Promise(r => setTimeout(r, 2000));
+            const result = await callAiApi(question, options, type, safeMode);
+            if (result.answer) return result.answer;
+
+            if (result.errorType === 'sensitive') {
+                safeMode = true;
+                log('检测到敏感拦截，已切换到更保守的提示词重试...', 'warn');
+            }
+
+            const waitMs = result.errorType === 'rate_limit' ? 4500 : 2000;
+            log(`AI 第 ${i + 1} 次尝试失败，准备重试...`, 'warn');
+            await new Promise(r => setTimeout(r, waitMs));
         }
         return null;
     }
 
 
     // --- 6. 页面处理逻辑 ---
-        async function processTestPage() {
-        log("进入答题页面，等待加载...");
-        await new Promise(r => setTimeout(r, 3000));
+    async function processTestPage() {
+        log("进入答题页面，等待题目加载...");
+        clearAllPendingQuestions('新一轮答题开始，重置待补答清单');
         
         let loopLimit = 50;
-        let loopCount = 0;
         
-        while(autoMode && loopCount < loopLimit) {
-            loopCount++;
-            await new Promise(r => setTimeout(r, 1500));
+        let maxPasses = 3;
+        let currentPass = 0;
+        const AI_FAIL_BREAKER_LIMIT = 2;
+        const PENDING_BREAKER_LIMIT = 3;
+        const aiFailStore = unsafeWindow.__aiFailStore || (unsafeWindow.__aiFailStore = {});
+
+        function buildQuestionKey(type, title) {
+            return `${type || '未知题型'}::${title || '未知题目'}`;
+        }
+
+        function increaseAiFailCount(questionKey) {
+            aiFailStore[questionKey] = (aiFailStore[questionKey] || 0) + 1;
+            return aiFailStore[questionKey];
+        }
+
+        function clearAiFailCount(questionKey) {
+            if (aiFailStore[questionKey]) delete aiFailStore[questionKey];
+        }
+
+        function triggerAiCircuitBreaker(qTypeText, qTitle, failCount) {
+            log(`AI 熔断触发: 同一题连续失败 ${failCount} 次，停止自动答题防止误提交。题目: (${qTypeText}) ${qTitle}`, 'error');
+            toggleAutoMode(false);
+        }
+
+        while (autoMode && currentPass < maxPasses) {
+            currentPass++;
+            log(`开始第 ${currentPass} 轮答题扫描...`);
+            let loopCount = 0;
             
-            // 提取当前题目内容
-            const qContent = document.querySelector('.questionContent');
-            if(!qContent) {
-                log("未找到题目区域，可能已结束或未加载...");
-                break;
-            }
-            
-            const qTitleNode = qContent.querySelector('.centent-pre pre.preStyle');
-            const qTitle = qTitleNode ? qTitleNode.innerText.trim() : "";
-            
-            const qTypeNode = qContent.querySelector('.letterSortNum');
-            const qTypeText = qTypeNode ? qTypeNode.innerText.trim() : "未知题型";
-            
-            if(!qTitle) {
-                log("未找到题目文本...");
-                break;
-            }
-            
-            log(`处理题目 (${qTypeText}): ${qTitle}`);
-            
-            // 判断是否为填空题
-            if(qTypeText.includes("填空")) {
-                const inputs = qContent.querySelectorAll('.input-ques .fillAnswer input.el-input__inner, .input-ques .fillAnswer textarea.el-textarea__inner');
-                if(inputs && inputs.length > 0) {
-                    log(`检测到填空题，共 ${inputs.length} 个空，开始获取答案...`);
-                    // 填空题直接使用AI或者特定的提示词
-                    const ansStr = await getAnswer(qTitle + " (请按顺序给出填空答案，如果有多个空，请用'||'分隔，不要输出其他废话)", [], "填空题");
+            while(autoMode && loopCount < loopLimit) {
+                loopCount++;
+                
+                // 动态等待当前题目内容出现，防止网络慢导致没刷出来就跳过
+                const qContent = await waitForElement('.questionContent', 15000);
+                if(!qContent) {
+                    log("未找到题目区域，可能已答完或网络卡顿超时...");
+                    break;
+                }
+                
+                // 给 Vue 渲染一点时间
+                await new Promise(r => setTimeout(r, 1000));
+
+                const qTitleNode = qContent.querySelector('.centent-pre pre.preStyle');
+                const qTitle = qTitleNode ? qTitleNode.innerText.trim() : "";
+                
+                const qTypeNode = qContent.querySelector('.letterSortNum');
+                const qTypeText = qTypeNode ? qTypeNode.innerText.trim() : "未知题型";
+                const questionKey = buildQuestionKey(qTypeText, qTitle);
+
+                if (hasQuestionAttempted(questionKey)) {
+                    clearQuestionPending(questionKey);
+                }
+                
+                const isAlreadyAnswered = isQuestionAnswered(qContent);
+
+                if (isAlreadyAnswered) {
+                    clearAiFailCount(questionKey);
+                    clearQuestionPending(questionKey);
+                    log("当前题目已作答，跳过AI请求...");
+                } else {
+                    if(!qTitle) {
+                        log("未找到题目文本...");
+                        break;
+                    }
                     
-                    if(ansStr) {
-                        const ansList = ansStr.split('||').map(s => s.trim());
-                        for(let i=0; i < inputs.length; i++) {
-                            if(ansList[i]) {
-                                log(`填入第 ${i+1} 空: ${ansList[i]}`);
-                                const inputElement = inputs[i];
-                                
-                                // 根据标签类型获取对应的原生setter
-                                const proto = inputElement.tagName.toUpperCase() === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
-                                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(proto, "value").set;
-                                
-                                inputElement.focus();
-                                inputElement.dispatchEvent(new Event('focus', { bubbles: true }));
-                                
-                                // 调用原生setter绕过Vue劫持
-                                if (nativeInputValueSetter) {
-                                    nativeInputValueSetter.call(inputElement, ansList[i]);
-                                } else {
-                                    inputElement.value = ansList[i];
+                    log(`处理题目 (${qTypeText}): ${qTitle}`);
+                    
+                    // 判断是否为填空题
+                    if(qTypeText.includes("填空")) {
+                        const inputs = qContent.querySelectorAll('.input-ques .fillAnswer input.el-input__inner, .input-ques .fillAnswer textarea.el-textarea__inner');
+                        if(inputs && inputs.length > 0) {
+                            log(`检测到填空题，共 ${inputs.length} 个空，开始获取答案...`);
+                            // 填空题直接使用AI或者特定的提示词
+                            const ansStr = await getAnswer(qTitle + " (请按顺序给出填空答案，如果有多个空，请用'||'分隔，不要输出其他废话)", [], "填空题");
+                            
+                            if(ansStr) {
+                                clearAiFailCount(questionKey);
+                                markQuestionAttempted(questionKey);
+                                const ansList = ansStr.split('||').map(s => s.trim());
+                                for(let i=0; i < inputs.length; i++) {
+                                    if(ansList[i]) {
+                                        log(`填入第 ${i+1} 空: ${ansList[i]}`);
+                                        const inputElement = inputs[i];
+                                        
+                                        // 根据标签类型获取对应的原生setter
+                                        const proto = inputElement.tagName.toUpperCase() === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+                                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(proto, "value").set;
+                                        
+                                        inputElement.focus();
+                                        inputElement.dispatchEvent(new Event('focus', { bubbles: true }));
+                                        
+                                        // 调用原生setter绕过Vue劫持
+                                        if (nativeInputValueSetter) {
+                                            nativeInputValueSetter.call(inputElement, ansList[i]);
+                                        } else {
+                                            inputElement.value = ansList[i];
+                                        }
+
+                                        // 触发一连串的事件，确保Vue/Element-UI能够捕获并更新v-model
+                                        inputElement.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                                        inputElement.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                                        inputElement.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'Enter', code: 'Enter', keyCode: 13 }));
+                                        inputElement.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, cancelable: true, key: 'Enter', code: 'Enter', keyCode: 13 }));
+                                        inputElement.dispatchEvent(new Event('blur', { bubbles: true }));
+                                        inputElement.blur();
+                                    }
                                 }
 
-                                // 触发一连串的事件，确保Vue/Element-UI能够捕获并更新v-model
-                                inputElement.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-                                inputElement.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-                                inputElement.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'Enter', code: 'Enter', keyCode: 13 }));
-                                inputElement.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, cancelable: true, key: 'Enter', code: 'Enter', keyCode: 13 }));
-                                inputElement.dispatchEvent(new Event('blur', { bubbles: true }));
-                                inputElement.blur();
+                                await new Promise(r => setTimeout(r, 300));
+                                if (isQuestionAnswered(qContent)) {
+                                    clearQuestionPending(questionKey);
+                                } else {
+                                    markQuestionPending(questionKey, `填空题写入后仍为空: (${qTypeText}) ${qTitle}`);
+                                }
+                            } else {
+                                log("未获取到填空题答案，暂时跳过。", 'warn');
+                                markQuestionPending(questionKey, `填空题AI失败: (${qTypeText}) ${qTitle}`);
+                                const failCount = increaseAiFailCount(questionKey);
+                                log(`当前题AI失败计数: ${failCount}/${AI_FAIL_BREAKER_LIMIT}`, 'warn');
+                                if (failCount >= AI_FAIL_BREAKER_LIMIT) {
+                                    triggerAiCircuitBreaker(qTypeText, qTitle, failCount);
+                                    return;
+                                }
                             }
                         }
                     } else {
-                        log("未获取到填空题答案。");
+                        // 选择题 (单选/多选/判断)
+                        const optionNodes = qContent.querySelectorAll('.el-radio, .el-checkbox, .option-item, .topic-option-item, ul.radio-view li');
+                        if(optionNodes && optionNodes.length > 0) {
+                            const optionsText = Array.from(optionNodes).map(el => {
+                                const preNode = el.querySelector('.preStyle') || el.querySelector('.option-content') || el.querySelector('.stem');
+                                return preNode ? preNode.innerText.trim() : el.innerText.trim();
+                            });
+                            
+                            const answer = await getAnswer(qTitle, optionsText, qTypeText);
+                            if (answer) {
+                                clearAiFailCount(questionKey);
+                                log(`尝试选择答案: ${answer}`);
+                                for (let char of answer) {
+                                    const optionIndex = char.charCodeAt(0) - 65;
+                                    if (optionIndex >= 0 && optionIndex < optionNodes.length) {
+                                        const inputElement = optionNodes[optionIndex].querySelector('.el-radio__original, .el-checkbox__original, input[type="radio"], input[type="checkbox"]') || optionNodes[optionIndex];
+                                        if (inputElement) { 
+                                            reliableClick(inputElement); 
+                                            markQuestionAttempted(questionKey);
+                                        } else { 
+                                            log(`错误：找不到选项 ${char} 的点击元素。`); 
+                                        }
+                                        await new Promise(r => setTimeout(r, 200));
+                                    }
+                                }
+
+                                await new Promise(r => setTimeout(r, 300));
+                                if (isQuestionAnswered(qContent)) {
+                                    clearQuestionPending(questionKey);
+                                } else {
+                                    markQuestionPending(questionKey, `选择题点击后仍未选中: (${qTypeText}) ${qTitle}`);
+                                }
+                            } else {
+                                log("未找到选择题答案，暂时跳过。", 'warn');
+                                markQuestionPending(questionKey, `选择题AI失败: (${qTypeText}) ${qTitle}`);
+                                const failCount = increaseAiFailCount(questionKey);
+                                log(`当前题AI失败计数: ${failCount}/${AI_FAIL_BREAKER_LIMIT}`, 'warn');
+                                if (failCount >= AI_FAIL_BREAKER_LIMIT) {
+                                    triggerAiCircuitBreaker(qTypeText, qTitle, failCount);
+                                    return;
+                                }
+                            }
+                        } else {
+                            log("既不是填空题也没找到选择项，跳过...");
+                        }
                     }
                 }
-            } else {
-                // 选择题 (单选/多选/判断)
-                const optionNodes = qContent.querySelectorAll('.el-radio, .el-checkbox, .option-item, .topic-option-item, ul.radio-view li');
-                if(optionNodes && optionNodes.length > 0) {
-                    const optionsText = Array.from(optionNodes).map(el => {
-                        const preNode = el.querySelector('.preStyle') || el.querySelector('.option-content') || el.querySelector('.stem');
-                        return preNode ? preNode.innerText.trim() : el.innerText.trim();
-                    });
-                    
-                    const answer = await getAnswer(qTitle, optionsText, qTypeText);
-                    if (answer) {
-                        log(`尝试选择答案: ${answer}`);
-                        for (let char of answer) {
-                            const optionIndex = char.charCodeAt(0) - 65;
-                            if (optionIndex >= 0 && optionIndex < optionNodes.length) {
-                                const inputElement = optionNodes[optionIndex].querySelector('.el-radio__original, .el-checkbox__original, input[type="radio"], input[type="checkbox"]') || optionNodes[optionIndex];
-                                if (inputElement) { 
-                                    reliableClick(inputElement); 
-                                } else { 
-                                    log(`错误：找不到选项 ${char} 的点击元素。`); 
-                                }
-                                await new Promise(r => setTimeout(r, 200));
-                            }
-                        }
-                    } else {
-                        log("未找到选择题答案。");
+
+                // 关键修复：若当前题仍未作答，不允许直接进入“已全部完成”路径
+                if (hasCurrentQuestionUnanswered()) {
+                    if (!hasQuestionAttempted(questionKey)) {
+                        markQuestionPending(questionKey, `当前题未作答: (${qTypeText}) ${qTitle}`);
                     }
+                    log("当前题仍未作答（可能AI失败），标记为漏题，后续将优先补答。", 'warn');
                 } else {
-                    log("既不是填空题也没找到选择项，跳过...");
+                    clearQuestionPending(questionKey);
+                }
+                
+                // 翻页
+                await new Promise(r => setTimeout(r, 1500));
+                const nextBtn = document.querySelector('.next-topic.next-t');
+                if(nextBtn) {
+                    log("点击下一题...");
+                    reliableClick(nextBtn);
+                    await new Promise(r => setTimeout(r, 1000));
+                } else {
+                    log("没有下一题按钮，已经是最后一题。");
+                    break;
                 }
             }
-            
-            // 翻页
+
+            // 一轮结束后，检查是否有未答的题目
+            log("本轮扫描结束，检查是否有未作答题目...");
             await new Promise(r => setTimeout(r, 1500));
-            const nextBtn = document.querySelector('.next-topic.next-t');
-            if(nextBtn) {
-                log("点击下一题...");
-                reliableClick(nextBtn);
-                await new Promise(r => setTimeout(r, 1000));
+            const pendingCount = reconcilePendingQuestionsWithDom();
+            const unansweredOutsideCurrentCount = getUnansweredOutsideCurrentItems().length;
+            if (pendingCount > 0) {
+                log(`本轮结束检测到待补答题目 ${pendingCount} 个，开始回补...`, 'warn');
+            }
+
+            if (pendingCount > 0 || unansweredOutsideCurrentCount > 0 || jumpToFirstUnanswered('本轮扫描后发现仍有漏题。')) {
+                if (hasCurrentQuestionUnanswered()) {
+                    log('本轮结束时当前题未作答，留在本题准备下一轮补答...', 'warn');
+                } else if (pendingCount > 0) {
+                    jumpToFirstQuestionCard('根据待补答清单，跳转到题卡第1题重新核查...');
+                }
+                await new Promise(r => setTimeout(r, 2000));
             } else {
-                log("没有下一题按钮，已经是最后一题。");
-                break;
+                log("检查完毕：所有题目似乎都已作答，准备提交。");
+                break; 
             }
         }
         
         if (autoMode) {
-            log("所有题目回答完毕，准备提交...");
-            await new Promise(r => setTimeout(r, 2000));
-            const submitButton = document.querySelector('.reviewDone');
+            log("所有题目处理完毕，准备提交...");
+
+            const pendingBeforeSubmit = reconcilePendingQuestionsWithDom();
+            const unansweredOutsideCurrentBeforeSubmit = getUnansweredOutsideCurrentItems().length;
+            if (pendingBeforeSubmit >= PENDING_BREAKER_LIMIT) {
+                log(`熔断触发: 待补答题目仍有 ${pendingBeforeSubmit} 个，停止自动答题，避免误提交。`, 'error');
+                toggleAutoMode(false);
+                return;
+            }
+
+            // 提交前强制检查一次，确保没有漏题
+            if (pendingBeforeSubmit > 0 || unansweredOutsideCurrentBeforeSubmit > 0 || jumpToFirstUnanswered('提交前拦截:')) {
+                if (unansweredOutsideCurrentBeforeSubmit > 0) {
+                    log('提交前拦截: 发现非当前题仍未作答，先回补。', 'warn');
+                } else if (pendingBeforeSubmit > 0) {
+                    jumpToFirstQuestionCard(`提交前拦截: 待补答清单还有 ${pendingBeforeSubmit} 题，先回补。`);
+                }
+                await new Promise(r => setTimeout(r, 2000));
+                setTimeout(processTestPage, 1000);
+                return;
+            }
+
+            // 动态等待提交按钮，最多等5秒
+            const submitButton = await waitForElement('.reviewDone', 5000);
             if(submitButton) {
+                await new Promise(r => setTimeout(r, 1000));
                 reliableClick(submitButton);
                 log("已点击提交作业按钮。");
-                // 处理弹窗
-                await new Promise(r => setTimeout(r, 1000));
+                
+                // 处理弹窗 (未作答提示 或 确认提交)
+                const dialogEl = await waitForElement('.el-dialog__wrapper, .el-message-box__wrapper, .van-dialog', 5000);
+
+                // 提交后无响应兜底：重新检查是否漏题
+                if (!dialogEl && window.location.href.includes('/studentReviewTestOrExam/')) {
+                    log('提交后未检测到弹窗或跳转，重新检查是否有漏题...', 'warn');
+                    const pendingAfterSubmit = reconcilePendingQuestionsWithDom();
+                    const unansweredOutsideCurrentAfterSubmit = getUnansweredOutsideCurrentItems().length;
+                    if (pendingAfterSubmit > 0 || unansweredOutsideCurrentAfterSubmit > 0 || jumpToFirstUnanswered('提交无响应兜底:')) {
+                        if (unansweredOutsideCurrentAfterSubmit > 0) {
+                            log('提交无响应兜底: 发现非当前题未作答，先回补。', 'warn');
+                        } else if (pendingAfterSubmit > 0) {
+                            jumpToFirstQuestionCard(`提交无响应兜底: 待补答清单还有 ${pendingAfterSubmit} 题，先回补。`);
+                        }
+                        await new Promise(r => setTimeout(r, 2000));
+                        setTimeout(processTestPage, 1000);
+                        return;
+                    }
+                    log('未检测到漏题，等待后重试一次提交...', 'warn');
+                    await new Promise(r => setTimeout(r, 2000));
+                    reliableClick(submitButton);
+                    await waitForElement('.el-dialog__wrapper, .el-message-box__wrapper, .van-dialog', 4000);
+                }
+
+                await new Promise(r => setTimeout(r, 1000)); // 给弹窗动画时间
                 
                 let hasUnanswered = false;
                 const allDialogs = document.querySelectorAll('.el-dialog__wrapper, .el-message-box__wrapper, .van-dialog');
                 for(let dialog of allDialogs) {
-                    if(dialog.style.display !== 'none') {
+                    if(dialog.style.display !== 'none' && getComputedStyle(dialog).display !== 'none') {
                         const dialogText = dialog.innerText || "";
                         if (dialogText.includes("未作答") || dialogText.includes("未完成") || dialogText.includes("还有") || dialogText.includes("空白")) {
                             log("检测到未作答提示，取消提交，准备重新检查未做题目...");
@@ -486,12 +1014,7 @@
                 if (hasUnanswered) {
                     log("正在寻找未作答的题目...");
                     await new Promise(r => setTimeout(r, 1500));
-                    // 尝试在答题卡中寻找未作答的元素
-                    const unAnsweredItems = document.querySelectorAll('.answerCard .answer-item:not(.is-answered), .topic-list .topic-item:not(.done), .card-list li:not(.active)');
-                    if (unAnsweredItems.length > 0) {
-                        log(`找到 ${unAnsweredItems.length} 个未作答题目，跳转到第一个...`);
-                        reliableClick(unAnsweredItems[0]);
-                    } else {
+                    if (!jumpToFirstUnanswered('弹窗拦截:')) {
                         log("未能定位到未作答题目的具体位置，尝试点击上一题按钮回退...");
                         const prevBtn = document.querySelector('.prev-topic.prev-t');
                         if (prevBtn) reliableClick(prevBtn);
@@ -508,14 +1031,20 @@
 
     // 主页逻辑：自动悬停并点击"提升掌握度"按钮
     async function findAndScrollToIncompleteItem() {
-        await new Promise(r => setTimeout(r, 2000));
+        log("正在等待课程列表加载...");
+        const foundItems = await waitForElement('.item-content', 15000);
+        if (!foundItems) {
+            log("未能找到知识点列表，可能当前页面不是课程主页或网络极慢。");
+            return;
+        }
+        await new Promise(r => setTimeout(r, 1000)); // 给它一点时间渲染进度条
         
         const items = document.querySelectorAll('.item-content');
         log(`找到 ${items.length} 个知识点项`);
         
         let validItems = [];
         let index = 0;
-        let failedItems = JSON.parse(sessionStorage.getItem('failed_items') || '[]');
+        const noImproveCache = getNoImproveCache();
 
         for(let item of items) {
             const pctNode = item.querySelector('.el-progress__text span');
@@ -528,7 +1057,7 @@
             const titleNode = item.querySelector('.item-title');
             const itemName = titleNode ? titleNode.innerText.trim() : ('未知知识点' + index);
 
-            if(pct < 100 && !failedItems.includes(itemName)) {
+            if(pct < 100 && !noImproveCache.includes(itemName)) {
                 validItems.push({ element: item, pct: pct, index: index, name: itemName });
             }
             index++;
@@ -560,83 +1089,39 @@
             }
             log(`已点击进入知识点学习页，等待加载...`);
         } else {
-            log("当前页面没有未满100%的有效知识点，或剩余知识点暂无题目，任务结束。");
+            log("当前页面没有未满100%的有效知识点，或都在无去提升缓存中，任务结束。");
             toggleAutoMode(false);
         }
     }
 
-    async function launchMasteryExam(retryCount = 0) {
-        await new Promise(r => setTimeout(r, 2000));
-        const btn = document.querySelector('.simplified-mastery__action');
-        if(btn) {
-            log("找到「去提升」按钮，点击进入答题...");
-            reliableClick(btn);
-
-            // 检查是否跳转成功，或是否弹出了“暂无题目”等错误提示
-            let checkCount = 0;
-            const checkNav = setInterval(() => {
-                checkCount++;
-                
-                // 检查 Element UI 消息提示
-                const messages = document.querySelectorAll('.el-message__content');
-                let hasErrorMsg = false;
-                for(let msg of messages) {
-                    if(msg.innerText.includes('题') || msg.innerText.includes('无') || msg.innerText.includes('空')) {
-                        hasErrorMsg = true;
-                        break;
-                    }
-                }
-                
-                if (!window.location.href.includes('/learnPage/')) {
-                    clearInterval(checkNav); // 跳转成功
-                } else if (checkCount >= 5 || hasErrorMsg) { 
-                    clearInterval(checkNav);
-                    log("点击去提升后未跳转或提示无题目，将跳过此章节...");
-                    
-                    // 加入黑名单防止无限循环
-                    let failedItems = JSON.parse(sessionStorage.getItem('failed_items') || '[]');
-                    let lastItem = sessionStorage.getItem('last_attempted_item');
-                    if (lastItem && !failedItems.includes(lastItem)) {
-                        failedItems.push(lastItem);
-                        sessionStorage.setItem('failed_items', JSON.stringify(failedItems));
-                    }
-                    
-                    // 尝试返回
-                    sessionStorage.setItem('need_refresh', 'true');
-                    const courseUrl = sessionStorage.getItem('course_list_url');
-                    if (courseUrl) {
-                        window.location.href = courseUrl;
-                    } else {
-                        window.history.back();
-                    }
-                }
-            }, 1000);
-
-        } else {
-            if (retryCount < 3) {
-                log(`未找到「去提升」按钮，可能页面未加载完毕，等待重试...(${retryCount + 1}/3)`);
-                if(autoMode) setTimeout(() => launchMasteryExam(retryCount + 1), 2000);
-            } else {
-                log("确认当前页面没有「去提升」按钮（可能是暂无题目或已满分），将跳过此章节...");
-                
-                // 加入黑名单防止无限循环
-                let failedItems = JSON.parse(sessionStorage.getItem('failed_items') || '[]');
-                let lastItem = sessionStorage.getItem('last_attempted_item');
-                if (lastItem && !failedItems.includes(lastItem)) {
-                    failedItems.push(lastItem);
-                    sessionStorage.setItem('failed_items', JSON.stringify(failedItems));
-                }
-                
-                // 标记需要刷新并直接跳回主列表
-                sessionStorage.setItem('need_refresh', 'true');
-                const courseUrl = sessionStorage.getItem('course_list_url');
-                if (courseUrl) {
-                    window.location.href = courseUrl;
-                } else {
-                    window.history.back();
-                }
-            }
+    async function handleLearnPage() {
+        log("当前在 learnPage，寻找「去提升」按钮...");
+        const timeout = Date.now() + 8000;
+        let btn = null;
+        while (Date.now() < timeout) {
+            btn = findImproveButton();
+            if (btn) break;
+            await new Promise(r => setTimeout(r, 500));
         }
+
+        if (btn) {
+            const currentItemName = getCurrentLearnItemName();
+            if (currentItemName) {
+                sessionStorage.setItem('last_attempted_item', currentItemName);
+            }
+            const btnText = (btn.textContent || btn.innerText || '').trim();
+            log(`找到可点击按钮: "${btnText}"，准备点击...`, 'debug');
+            reliableClick(btn);
+            return;
+        }
+
+        const currentItemName = getCurrentLearnItemName() || sessionStorage.getItem('last_attempted_item') || '';
+        if (currentItemName) {
+            addToNoImproveCache(currentItemName);
+        } else {
+            log('未能识别当前章节名，但已判定本页无去提升。');
+        }
+        goToCourseList('当前 learnPage 无「去提升」，回 singleCourse 重新找高优先级章节...');
     }
 
     async function processMasteryHistory() {
@@ -653,61 +1138,47 @@
     }
 
     async function processPointPage() {
-        log("进入知识点结算页面，准备返回...");
-        await new Promise(r => setTimeout(r, 3000)); // 给点时间看成绩
-        const backBtn = document.querySelector('.backup-icon') || document.querySelector('.backup');
-        if(backBtn) {
-            log("点击返回按钮，准备开启下一轮...");
-            sessionStorage.setItem('need_refresh', 'true');
-            reliableClick(backBtn);
-        } else {
-            log("未找到返回按钮，尝试直接返回...");
-            sessionStorage.setItem('need_refresh', 'true');
-            window.history.back();
-        }
+        log("进入知识点结算页面，等待成绩加载...");
+        await new Promise(r => setTimeout(r, 2000)); // 给点时间看成绩
+
+        goToCourseList('结算页处理完成，返回 singleCourse 继续按优先级找题...');
     }
 
     function mainLoop() {
         if (!autoMode) return;
         const currentUrl = window.location.href;
         
-        // 记录课程主列表的URL，方便后面直接跳回来
+        // 记录课程主列表URL
         if (currentUrl.includes('/singleCourse/')) {
             sessionStorage.setItem('course_list_url', currentUrl);
         }
 
-        // --- 核心修复：处理答题结束后的返回与刷新逻辑 ---
-        if (sessionStorage.getItem('need_refresh') === 'true') {
-            if (currentUrl.includes('/learnPage/')) {
-                // 1. 从分数结算页退回时，落在“章节学习页 (/learnPage/)”
-                // 此时直接强制跳回主列表的URL，避免触发浏览器的奇怪历史记录前进后退问题导致死循环
-                log("已退回到章节页，准备直接跳转回课程主列表并刷新...");
-                const courseUrl = sessionStorage.getItem('course_list_url');
-                if (courseUrl) {
-                    window.location.href = courseUrl; // 直接导航过去
-                } else {
-                    window.history.back(); // 兜底
-                }
-                return; // 中断本次执行，等待回到主列表
-            } else if (currentUrl.includes('/singleCourse/')) {
-                // 2. 成功回到“课程主列表 (/singleCourse/)”后，立即强制刷新
-                sessionStorage.removeItem('need_refresh');
-                log("已回到主列表，正在强制刷新页面以获取最新掌握度...");
-                location.reload();
-                return; // 刷新后脚本会重新加载
-            }
-        }
-
         if (currentUrl.includes('/singleCourse/')) {
-            findAndScrollToIncompleteItem();
+            findAndScrollToIncompleteItem().catch(err => {
+                log(`singleCourse处理异常: ${err.message}`);
+            });
         } else if (currentUrl.includes('/learnPage/')) {
-            launchMasteryExam();
+            handleLearnPage().catch(err => {
+                log(`learnPage处理异常: ${err.message}`);
+                goToCourseList('learnPage异常，回课程主页继续执行...');
+            });
         } else if (currentUrl.includes('/masteryHistory/')) {
-            processMasteryHistory();
+            processMasteryHistory().catch(err => {
+                log(`masteryHistory处理异常: ${err.message}`);
+            });
         } else if (currentUrl.includes('/studentReviewTestOrExam/')) {
-            processTestPage();
+            processTestPage().catch(err => {
+                log(`答题页处理异常: ${err.message}`);
+            });
         } else if (currentUrl.includes('/point/')) {
-            processPointPage();
+            processPointPage().catch(err => {
+                log(`结算页处理异常: ${err.message}`);
+                goToCourseList('结算页异常，回课程主页继续执行...');
+            });
+        } else if (currentUrl.includes('/mySpace/')) {
+            log("当前在 mySpace，请先手动进入某个课程的 singleCourse 页面。");
+        } else {
+            log("当前页面不在课程流程内，请手动进入 singleCourse 页面。");
         }
     }
 
@@ -715,9 +1186,13 @@
         autoMode = start;
         GM_setValue('autoMode_state', start);
         if (autoMode) {
+            clearLogBuffer();
+            // 启动后不清空永久缓存，只重置本轮状态
+            sessionStorage.removeItem('last_attempted_item');
+            
             startButton.textContent = '停止自动答题';
             startButton.style.backgroundColor = '#dc3545';
-            log('自动答题已开始！');
+            log('自动答题已开始！(永久无去提升缓存已保留)');
             mainLoop();
         } else {
             startButton.textContent = '开始自动答题';
@@ -728,17 +1203,26 @@
 
     // --- 6. 启动脚本和监听器 ---
     let lastUrl = location.href;
+    let navTimeout = null;
+    
     new MutationObserver(() => {
         const url = location.href;
         if (url !== lastUrl) {
             lastUrl = url;
             log(`URL 变动: ${url}`);
-            if (autoMode) setTimeout(mainLoop, 2000);
+            if (autoMode) {
+                // 加入防抖(Debounce)，防止中间过程的无用跳转触发多次逻辑
+                if (navTimeout) clearTimeout(navTimeout);
+                navTimeout = setTimeout(() => {
+                    mainLoop();
+                }, 2500); 
+            }
         }
     }).observe(document, { subtree: true, childList: true });
 
     window.addEventListener('load', () => {
-        log("AI答题脚本已加载。点击上方按钮开始自动答题。");
+        renderLogBuffer();
+        log("AI答题脚本已加载。点击上方按钮开始自动答题。", 'debug');
         
         // 恢复自动答题状态
         if (autoMode) {
