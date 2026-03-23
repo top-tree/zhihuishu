@@ -1,25 +1,18 @@
 // ==UserScript==
-// @name         知到智慧树掌握度答题-AI自动答题脚本(Zhihuishu AI Auto-Answering)
-// @namespace    https://github.com/Cooanyh/zhihuishu-zhangwodu
-// @version      2.0.0
-// @description  全自动完成智慧树掌握度练习。支持多页面布局适配、智能弹窗探测与精准匹配。集成题库搜索与多种AI服务商(DeepSeek/Zhipu/OpenAI/Gemini/Coren)自动Fallback。
-// @author       Coren
+// @name         智慧树掌握度AI全自动答题
+// @version      1.0.0
+// @description  全自动完成智慧树掌握度练习, 支持自定义AI模型及免费代理。
+// @author       top tree
 // @match        *://ai-smart-course-student-pro.zhihuishu.com/*
 // @match        *://studentexamcomh5.zhihuishu.com/studentReviewTestOrExam/*
 // @connect      api.coren.xin
-// @connect      open.bigmodel.cn
-// @connect      api.deepseek.com
-// @connect      api.openai.com
-// @connect      generativelanguage.googleapis.com
-// @connect      gist.githubusercontent.com
 // @connect      *
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        unsafeWindow
-// @license      CC BY-NC-SA 4.0
-// @license      https://creativecommons.org/licenses/by-nc-sa/4.0/deed.zh
+// @license      MIT
 // ==/UserScript==
 
 (function () {
@@ -572,7 +565,7 @@
         }
     }
 
-    async function launchMasteryExam() {
+    async function launchMasteryExam(retryCount = 0) {
         await new Promise(r => setTimeout(r, 2000));
         const btn = document.querySelector('.simplified-mastery__action');
         if(btn) {
@@ -609,10 +602,10 @@
                     }
                     
                     // 尝试返回
-                    const backBtn = document.querySelector('.backup-icon') || document.querySelector('.el-page-header__left') || document.querySelector('.back-btn');
                     sessionStorage.setItem('need_refresh', 'true');
-                    if (backBtn) {
-                        reliableClick(backBtn);
+                    const courseUrl = sessionStorage.getItem('course_list_url');
+                    if (courseUrl) {
+                        window.location.href = courseUrl;
                     } else {
                         window.history.back();
                     }
@@ -620,10 +613,28 @@
             }, 1000);
 
         } else {
-            log("未找到「去提升」按钮，可能已掌握100%或页面未加载完毕");
-            // If autoMode is true, maybe wait and retry, or disable
-            if(autoMode) {
-               setTimeout(launchMasteryExam, 3000);
+            if (retryCount < 3) {
+                log(`未找到「去提升」按钮，可能页面未加载完毕，等待重试...(${retryCount + 1}/3)`);
+                if(autoMode) setTimeout(() => launchMasteryExam(retryCount + 1), 2000);
+            } else {
+                log("确认当前页面没有「去提升」按钮（可能是暂无题目或已满分），将跳过此章节...");
+                
+                // 加入黑名单防止无限循环
+                let failedItems = JSON.parse(sessionStorage.getItem('failed_items') || '[]');
+                let lastItem = sessionStorage.getItem('last_attempted_item');
+                if (lastItem && !failedItems.includes(lastItem)) {
+                    failedItems.push(lastItem);
+                    sessionStorage.setItem('failed_items', JSON.stringify(failedItems));
+                }
+                
+                // 标记需要刷新并直接跳回主列表
+                sessionStorage.setItem('need_refresh', 'true');
+                const courseUrl = sessionStorage.getItem('course_list_url');
+                if (courseUrl) {
+                    window.location.href = courseUrl;
+                } else {
+                    window.history.back();
+                }
             }
         }
     }
