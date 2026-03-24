@@ -289,6 +289,7 @@ if (isBrowserRuntime) {
             optionClickableInput: '.el-radio__original, .el-checkbox__original, input[type="radio"], input[type="checkbox"]',
             optionCheckedInputs: '.el-radio__input.is-checked, .el-checkbox__input.is-checked, input[type="radio"]:checked, input[type="checkbox"]:checked',
             checkedFallback: '.el-radio__input.is-checked, .el-checkbox__input.is-checked, input[type="radio"]:checked, input[type="checkbox"]:checked, [aria-checked="true"], .option-item.active, .topic-option-item.active',
+            anyCheckedGlobal: '.el-radio__input.is-checked, .el-checkbox__input.is-checked, input[type="radio"]:checked, input[type="checkbox"]:checked, [aria-checked="true"], .is-checked, .checked, .selected, .active',
             submitButton: '.reviewDone',
             nextButton: '.next-topic.next-t',
             answerCardFirstItem: '.answerCard .answer-item, .topic-list .topic-item, .card-list li, .answer-sheet li, .sheet-list li, .question-card li, .topic-card-item',
@@ -604,8 +605,17 @@ if (isBrowserRuntime) {
 
     function reliableClick(element) {
         if (!element) { log("警告: 尝试点击一个不存在的元素。"); return; }
-        const clickEvent = new MouseEvent('click', { bubbles: true, cancelable: true, view: unsafeWindow });
-        element.dispatchEvent(clickEvent);
+        try {
+            element.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: unsafeWindow }));
+            element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: unsafeWindow }));
+        } catch (e) {}
+
+        if (typeof element.click === 'function') {
+            element.click();
+        } else {
+            const clickEvent = new MouseEvent('click', { bubbles: true, cancelable: true, view: unsafeWindow });
+            element.dispatchEvent(clickEvent);
+        }
     }
 
     function setInputValueReliably(inputElement, value) {
@@ -649,6 +659,48 @@ if (isBrowserRuntime) {
             await delay(interval);
         }
         return false;
+    }
+
+    function getQuestionSnapshot() {
+        const qContent = document.querySelector(SELECTORS.testPage.questionContent);
+        if (!qContent) return { key: '', title: '', type: '' };
+        const title = (qContent.querySelector(SELECTORS.testPage.questionTitle)?.innerText || '').replace(/\s+/g, ' ').trim();
+        const type = (qContent.querySelector(SELECTORS.testPage.questionType)?.innerText || '').replace(/\s+/g, ' ').trim();
+        const key = `${type}||${title}`;
+        return { key, title, type };
+    }
+
+    async function waitForQuestionChange(prevKey, timeout = 4500, interval = 180) {
+        const endTime = Date.now() + timeout;
+        while (Date.now() < endTime) {
+            const snap = getQuestionSnapshot();
+            if (snap.key && snap.key !== prevKey) {
+                return snap;
+            }
+            await delay(interval);
+        }
+        return null;
+    }
+
+    async function waitForQuestionStable(minStableMs = 320, timeout = 2500) {
+        const endTime = Date.now() + timeout;
+        let lastKey = '';
+        let stableSince = 0;
+        while (Date.now() < endTime) {
+            const snap = getQuestionSnapshot();
+            if (!snap.key) {
+                await delay(120);
+                continue;
+            }
+            if (snap.key !== lastKey) {
+                lastKey = snap.key;
+                stableSince = Date.now();
+            } else if (Date.now() - stableSince >= minStableMs) {
+                return snap;
+            }
+            await delay(120);
+        }
+        return getQuestionSnapshot();
     }
 
     function getNoImproveCache() {
@@ -822,7 +874,17 @@ if (isBrowserRuntime) {
         if (optionNode.classList.contains('is-checked') || optionNode.classList.contains('checked') || optionNode.classList.contains('selected') || optionNode.classList.contains('active')) {
             return true;
         }
+        if (optionNode.getAttribute('aria-checked') === 'true') {
+            return true;
+        }
+        const checkedParent = optionNode.closest('.is-checked, .checked, .selected, .active, [aria-checked="true"]');
+        if (checkedParent) {
+            return true;
+        }
         if (optionNode.querySelector(SELECTORS.testPage.optionCheckedInputs)) {
+            return true;
+        }
+        if (optionNode.querySelector('.is-checked, .checked, .selected, .active, [aria-checked="true"]')) {
             return true;
         }
         return false;
@@ -839,15 +901,63 @@ if (isBrowserRuntime) {
         return true;
     }
 
-    function areExpectedOptionsSelected(qContent, answerLetters) {
+    function areExpectedOptionsSelected(qContent, answerLetters, qTypeText = '') {
         const optionNodes = qContent.querySelectorAll(SELECTORS.testPage.optionNodes);
         if (!optionNodes || optionNodes.length === 0) return false;
+
+        const checkedCount = Array.from(optionNodes).filter(isOptionNodeChecked).length;
+        const isSingleLike = String(qTypeText || '').includes('单选') || String(qTypeText || '').includes('判断');
+        if (isSingleLike) {
+            if (qContent.querySelector(SELECTORS.testPage.checkedFallback)) {
+                return true;
+            }
+            if (document.querySelector(SELECTORS.testPage.anyCheckedGlobal)) {
+                return true;
+            }
+            if (checkedCount === 0) return false;
+            const target = String(answerLetters || '').trim().charAt(0);
+            const idx = target.charCodeAt(0) - 65;
+            if (idx >= 0 && idx < optionNodes.length && isOptionNodeChecked(optionNodes[idx])) {
+                return true;
+            }
+            return checkedCount > 0;
+        }
+
         for (const char of String(answerLetters || '')) {
             const idx = char.charCodeAt(0) - 65;
             if (idx < 0 || idx >= optionNodes.length) return false;
             if (!isOptionNodeChecked(optionNodes[idx])) return false;
         }
         return true;
+    }
+
+    function getCurrentQuestionContent() {
+        return document.querySelector(SELECTORS.testPage.questionContent);
+    }
+
+    function clickOptionReliably(optionNode) {
+        if (!optionNode) return;
+        const inputEl = optionNode.querySelector(SELECTORS.testPage.optionClickableInput) || optionNode;
+        reliableClick(optionNode);
+        reliableClick(inputEl);
+
+        const clickableParent = optionNode.closest('label, .el-radio, .el-checkbox, .option-item, .topic-option-item, li, div');
+        if (clickableParent && clickableParent !== optionNode) {
+            reliableClick(clickableParent);
+        }
+
+        const nativeInput = optionNode.querySelector('input[type="radio"], input[type="checkbox"]');
+        if (nativeInput && !nativeInput.checked) {
+            const proto = nativeInput.type === 'checkbox'
+                ? window.HTMLInputElement.prototype
+                : window.HTMLInputElement.prototype;
+            const checkedSetter = Object.getOwnPropertyDescriptor(proto, 'checked')?.set;
+            if (checkedSetter) {
+                checkedSetter.call(nativeInput, true);
+                nativeInput.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                nativeInput.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+            }
+        }
     }
 
     function isQuestionAnsweredByType(qContent, qTypeText) {
@@ -1149,8 +1259,9 @@ if (isBrowserRuntime) {
             const qTypeText = qContent.querySelector(SELECTORS.testPage.questionType)?.innerText.trim() || '未知题型';
             if (!qTitle) return { status: 'none' };
 
-            if (isQuestionAnsweredByType(qContent, qTypeText)) {
-                log('当前题检测到已有答案，执行覆盖式作答以确保稳定。', 'debug', 'QUESTION');
+            const hasAnswerBefore = isQuestionAnsweredByType(qContent, qTypeText);
+            if (hasAnswerBefore) {
+                log('当前题已存在作答痕迹，执行覆盖式作答以确保稳定。', 'debug', 'QUESTION');
             }
 
             log(`处理题目 (${qTypeText}): ${qTitle}`, 'info', 'QUESTION');
@@ -1188,30 +1299,45 @@ if (isBrowserRuntime) {
             log(`选择答案: ${answer}`, 'info', 'QUESTION');
 
             const answerChars = String(answer || '').split('');
-            for (let round = 1; round <= 2; round++) {
-                for (const char of answerChars) {
-                    const idx = char.charCodeAt(0) - 65;
-                    if (idx < 0 || idx >= optionNodes.length) continue;
-                    if (isOptionNodeChecked(optionNodes[idx])) continue;
-
-                    const inputElement = optionNodes[idx].querySelector(SELECTORS.testPage.optionClickableInput) || optionNodes[idx];
-                    reliableClick(inputElement);
-                    await delay(150);
+            for (let round = 1; round <= 4; round++) {
+                const latestQuestion = getCurrentQuestionContent();
+                if (!latestQuestion || !latestQuestion.isConnected) {
+                    return { status: 'none' };
+                }
+                const latestOptions = latestQuestion.querySelectorAll(SELECTORS.testPage.optionNodes);
+                if (!latestOptions || latestOptions.length === 0) {
+                    return { status: 'none' };
                 }
 
-                await delay(220);
-                if (areExpectedOptionsSelected(qContent, answer)) {
+                for (const char of answerChars) {
+                    const idx = char.charCodeAt(0) - 65;
+                    if (idx < 0 || idx >= latestOptions.length) continue;
+                    if (isOptionNodeChecked(latestOptions[idx])) continue;
+
+                    clickOptionReliably(latestOptions[idx]);
+                    await delay(220);
+                }
+
+                await delay(280);
+
+                const latestAfter = getCurrentQuestionContent();
+                if (!latestAfter || !latestAfter.isConnected) {
+                    return { status: 'none' };
+                }
+
+                if (areExpectedOptionsSelected(latestAfter, answer, qTypeText)) {
                     return { status: 'filled', stable: true };
                 }
             }
 
-            log('选项回读不稳定，已按当前结果继续。', 'warn', 'QUESTION');
+            log('选项状态回读不一致，继续执行并在提交环节做最终校验。', 'warn', 'QUESTION');
             return { status: 'filled', stable: false };
         }
 
         await gotoFirstQuestion();
 
         while (autoMode) {
+            const stable = await waitForQuestionStable(320, 2500);
             const qContent = await waitForElement(SELECTORS.testPage.questionContent, 8000);
             if (!qContent) {
                 log('未加载到题目区域，结束本轮。', 'warn', 'QUESTION');
@@ -1222,8 +1348,12 @@ if (isBrowserRuntime) {
             log(`开始作答当前题${questionPreview ? `: ${questionPreview}...` : ''}`, 'debug', 'QUESTION');
             const result = await answerCurrentQuestion(qContent);
             if (result?.status === 'none') {
+                if (!autoMode) break;
                 log('当前题未完成有效作答，尝试继续流程。', 'warn', 'QUESTION');
+                continue;
             }
+
+            if (!autoMode) break;
 
             const nextBtn = document.querySelector(SELECTORS.testPage.nextButton);
             if (!nextBtn) {
@@ -1231,9 +1361,13 @@ if (isBrowserRuntime) {
                 break;
             }
 
+            const currentKey = (stable && stable.key) ? stable.key : getQuestionSnapshot().key;
             log('点击下一题。', 'info', 'NAV');
             reliableClick(nextBtn);
-            await delay(650);
+            const changed = await waitForQuestionChange(currentKey, 4500, 180);
+            if (!changed) {
+                await delay(700);
+            }
         }
 
         if (autoMode) {
@@ -1243,6 +1377,7 @@ if (isBrowserRuntime) {
                 const restarted = await gotoFirstQuestion();
                 if (restarted) {
                     while (autoMode) {
+                        const stable = await waitForQuestionStable(320, 2500);
                         const qContent = await waitForElement(SELECTORS.testPage.questionContent, 8000);
                         if (!qContent) {
                             log('重做轮未加载到题目区域，结束。', 'warn', 'QUESTION');
@@ -1253,8 +1388,12 @@ if (isBrowserRuntime) {
                         log(`重做当前题${questionPreview ? `: ${questionPreview}...` : ''}`, 'debug', 'QUESTION');
                         const result = await answerCurrentQuestion(qContent);
                         if (result?.status === 'none') {
+                            if (!autoMode) break;
                             log('重做轮当前题未完成有效作答，继续后续流程。', 'warn', 'QUESTION');
+                            continue;
                         }
+
+                        if (!autoMode) break;
 
                         const nextBtn = document.querySelector(SELECTORS.testPage.nextButton);
                         if (!nextBtn) {
@@ -1262,8 +1401,12 @@ if (isBrowserRuntime) {
                             break;
                         }
 
+                        const currentKey = (stable && stable.key) ? stable.key : getQuestionSnapshot().key;
                         reliableClick(nextBtn);
-                        await delay(650);
+                        const changed = await waitForQuestionChange(currentKey, 4500, 180);
+                        if (!changed) {
+                            await delay(700);
+                        }
                     }
 
                     const done2 = await trySubmitCheck('重做轮完成');
