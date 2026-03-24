@@ -15,6 +15,119 @@
 // @license      MIT
 // ==/UserScript==
 
+const PureUtils = Object.freeze({
+    normalizeFullWidthLetters(text) {
+        return String(text || '').replace(/[Ａ-Ｚ]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 65248));
+    },
+    normalizeTextForMatch(text) {
+        return String(text || '')
+            .toLowerCase()
+            .replace(/\s+/g, '')
+            .replace(/[，。、“”‘’【】（）()《》：:；;,.!?！？'"`]/g, '');
+    },
+    previewText(text, maxLen = 60) {
+        const s = String(text || '').replace(/\s+/g, ' ').trim();
+        if (s.length <= maxLen) return s;
+        return `${s.slice(0, maxLen)}...`;
+    },
+    parseChoiceAnswer(rawContent, options, type) {
+        let text = PureUtils.normalizeFullWidthLetters(rawContent).trim();
+
+        if (type.includes('判断')) {
+            if (/对|正确|\btrue\b|\bT\b|√/i.test(text)) return 'A';
+            if (/错|错误|\bfalse\b|\bF\b|×/i.test(text)) return 'B';
+        }
+
+        let letters = text.toUpperCase().replace(/[^A-Z]/g, '');
+
+        if (!letters && options && options.length > 0) {
+            const normalizedReply = PureUtils.normalizeTextForMatch(text);
+            let matched = '';
+            options.forEach((opt, index) => {
+                const normOpt = PureUtils.normalizeTextForMatch(opt);
+                if (normOpt && normalizedReply.includes(normOpt)) {
+                    matched += String.fromCharCode(65 + index);
+                }
+            });
+            letters = matched;
+        }
+
+        const maxLetters = options ? options.length : 4;
+        const result = [];
+        for (const ch of letters) {
+            const idx = ch.charCodeAt(0) - 65;
+            if (idx >= 0 && idx < maxLetters && !result.includes(ch)) {
+                result.push(ch);
+            }
+        }
+
+        if (result.length === 0) return null;
+        if (type.includes('单选') || type.includes('判断')) return result[0];
+        return result.join('');
+    },
+    parseFillAnswer(rawContent) {
+        let text = String(rawContent || '').trim();
+        text = text.replace(/^答案[:：]?\s*/i, '');
+        text = text.replace(/^填空答案[:：]?\s*/i, '');
+        text = text.replace(/\r?\n+/g, '||');
+        return text || null;
+    },
+    normalizeFillAnswerByQuestion(question, rawAnswer) {
+        const cleaned = PureUtils.parseFillAnswer(rawAnswer);
+        if (!cleaned) return null;
+
+        const expected = Math.max(1, (String(question || '').match(/_{2,}|___|（\s*\)|\(\s*\)/g) || []).length);
+        const parts = cleaned.split('||').map(s => s.trim()).filter(Boolean);
+        if (parts.length === 0) return null;
+
+        if (parts.length === expected) return parts.join('||');
+        if (parts.length > expected) return parts.slice(0, expected).join('||');
+
+        while (parts.length < expected) {
+            parts.push(parts[parts.length - 1] || '');
+        }
+        return parts.join('||');
+    }
+});
+
+const CoreUtils = Object.freeze({
+    delay(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    },
+    createResult(ok, code, data = null, message = '') {
+        return { ok: !!ok, code: String(code || 'unknown'), data, message: String(message || '') };
+    },
+    async retryAsync(executor, options = {}) {
+        const attempts = Math.max(1, Number(options.attempts || 1));
+        const shouldRetry = typeof options.shouldRetry === 'function'
+            ? options.shouldRetry
+            : (result, attempt) => !result?.ok && attempt < attempts;
+        const getDelayMs = typeof options.getDelayMs === 'function'
+            ? options.getDelayMs
+            : () => 0;
+
+        let lastResult = CoreUtils.createResult(false, 'not_executed');
+        for (let attempt = 1; attempt <= attempts; attempt++) {
+            lastResult = await executor(attempt);
+            if (!shouldRetry(lastResult, attempt)) {
+                return lastResult;
+            }
+            const waitMs = Math.max(0, Number(getDelayMs(lastResult, attempt) || 0));
+            if (waitMs > 0) {
+                await CoreUtils.delay(waitMs);
+            }
+        }
+        return lastResult;
+    }
+});
+
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { PureUtils, CoreUtils };
+}
+
+const isBrowserRuntime = typeof window !== 'undefined' && typeof document !== 'undefined';
+
+if (isBrowserRuntime) {
 (function () {
     'use strict';
 
@@ -27,19 +140,25 @@
         #panel-content { padding: 20px; display: flex; flex-direction: column; gap: 15px; }
         #start-button { padding: 10px 15px; background-color: #198754; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; transition: background-color 0.3s; }
         #start-button:hover { background-color: #157347; }
-        #status-log { margin-top: 15px; padding: 10px; background-color: #f8f9fa; border-radius: 6px; height: 260px; overflow-y: auto; font-size: 12px; color: #495057; border: 1px solid #dee2e6; box-shadow: inset 0 1px 3px rgba(0,0,0,0.04); }
-        #status-log div { margin-bottom: 6px; line-height: 1.4; word-break: break-all; border-bottom: 1px dashed #f1f3f5; padding-bottom: 4px; }
-        #status-log div:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
-        #status-log .time { color: #adb5bd; margin-right: 6px; font-family: monospace; font-size: 11px; }
-        #status-log .level { display: inline-block; min-width: 50px; font-family: monospace; margin-right: 4px; }
-        #status-log .log-debug { background: #f1f3f5; border-left: 3px solid #adb5bd; padding-left: 6px; }
-        #status-log .log-info { background: #eef6ff; border-left: 3px solid #0d6efd; padding-left: 6px; }
-        #status-log .log-warn { background: #fff6e9; border-left: 3px solid #fd7e14; padding-left: 6px; }
-        #status-log .log-error { background: #fff1f3; border-left: 3px solid #dc3545; padding-left: 6px; }
-        #status-log .log-debug .level { color: #6c757d; }
-        #status-log .log-info .level { color: #0d6efd; }
-        #status-log .log-warn .level { color: #fd7e14; }
-        #status-log .log-error .level { color: #dc3545; }
+        #status-log { margin-top: 15px; padding: 10px; background-color: #f8fafc; border-radius: 8px; height: 260px; overflow-y: auto; font-size: 12px; color: #334155; border: 1px solid #dbe3ef; box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.05); }
+        #status-log .log-item { margin-bottom: 8px; border: 1px solid #e2e8f0; border-left: 3px solid #94a3b8; border-radius: 6px; background: #ffffff; padding: 6px 8px; line-height: 1.45; }
+        #status-log .log-item:last-child { margin-bottom: 0; }
+        #status-log .log-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 3px; font-size: 11px; }
+        #status-log .seq { color: #64748b; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+        #status-log .time { color: #94a3b8; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+        #status-log .cat { border-radius: 4px; padding: 0 6px; font-weight: 600; }
+        #status-log .level { color: #64748b; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+        #status-log .log-msg { white-space: pre-wrap; word-break: break-word; color: #334155; }
+        #status-log .cat-system { background: #eef2f7; color: #334155; border-left-color: #94a3b8; }
+        #status-log .cat-flow { background: #ecfdf5; color: #166534; border-left-color: #22c55e; }
+        #status-log .cat-ai { background: #eff6ff; color: #1d4ed8; border-left-color: #3b82f6; }
+        #status-log .cat-question { background: #fefce8; color: #854d0e; border-left-color: #eab308; }
+        #status-log .cat-submit { background: #f5f3ff; color: #6d28d9; border-left-color: #8b5cf6; }
+        #status-log .cat-error { background: #fef2f2; color: #b91c1c; border-left-color: #ef4444; }
+        #status-log .lv-debug .level { color: #94a3b8; }
+        #status-log .lv-success .level { color: #15803d; }
+        #status-log .lv-warn .level { color: #b45309; }
+        #status-log .lv-error .level { color: #b91c1c; }
         .setting-group { font-size: 13px; margin-bottom: 5px; }
         .setting-group label { display: block; margin-bottom: 4px; color: #333; }
         .setting-group input, .setting-group select { width: 100%; box-sizing: border-box; padding: 6px; border: 1px solid #ccc; border-radius: 4px; }
@@ -89,7 +208,108 @@
     const toggleButton = document.getElementById('panel-toggle');
     const startButton = document.getElementById('start-button');
     const statusLog = document.getElementById('status-log');
-    const LOG_BUFFER_KEY = 'runtime_log_buffer_v1';
+    let logSeq = 0;
+    const KEYS = Object.freeze({
+        gm: Object.freeze({
+            panelVisible: 'panel_visible_state',
+            autoMode: 'autoMode_state',
+            aiProvider: 'ai_provider',
+            aiUrl: 'ai_url',
+            aiKey: 'ai_key',
+            aiModel: 'ai_model',
+            panelPosLeft: 'panel_pos_left',
+            panelPosTop: 'panel_pos_top',
+            runtimeLogBuffer: 'runtime_log_buffer_v1',
+            noImproveCache: 'no_improve_cache_v1',
+            chapterQaMemory: 'chapter_qa_memory_v1',
+            currentChapterKeyGlobal: 'current_chapter_key_global_v1'
+        }),
+        session: Object.freeze({
+            currentChapterKey: 'current_chapter_key',
+            lastAttemptedItem: 'last_attempted_item',
+            courseListUrl: 'course_list_url',
+            lastExamPreviewUrl: 'last_exam_preview_url'
+        })
+    });
+    const storage = {
+        getGm(key, fallback) {
+            return GM_getValue(key, fallback);
+        },
+        setGm(key, value) {
+            GM_setValue(key, value);
+        },
+        getSession(key, fallback = '') {
+            const value = sessionStorage.getItem(key);
+            return value === null ? fallback : value;
+        },
+        setSession(key, value) {
+            sessionStorage.setItem(key, String(value));
+        },
+        removeSession(key) {
+            sessionStorage.removeItem(key);
+        }
+    };
+
+    const delay = CoreUtils.delay;
+    const createResult = CoreUtils.createResult;
+    const retryAsync = CoreUtils.retryAsync;
+
+    function navigateTo(url, reason = '', category = 'NAV') {
+        const target = String(url || '').trim();
+        if (reason) {
+            log(reason, 'info', category);
+        }
+        if (!target) {
+            return createResult(false, 'invalid_url', null, 'empty navigation target');
+        }
+        window.location.href = target;
+        return createResult(true, 'navigating', { target }, reason);
+    }
+
+    const SELECTORS = Object.freeze({
+        common: Object.freeze({
+            clickable: 'a, button, .el-button, .van-button, [role="button"], span, div',
+            dialogWrappers: '.el-dialog__wrapper, .el-message-box__wrapper, .van-dialog'
+        }),
+        learnPage: Object.freeze({
+            improveButtonCandidates: ['.simplified-mastery__action', '.improve-btn', 'button', '.el-button', '.van-button'],
+            improveButtonDirect: '.improve-btn',
+            activeItemName: '.title-text.active, .item-title.active, .section-item-collapse-info.active .title-text, .item-content.active .item-title',
+            itemContent: '.item-content',
+            itemTitle: '.item-title',
+            progressText: '.el-progress__text span'
+        }),
+        testPage: Object.freeze({
+            questionContent: '.questionContent',
+            questionTitle: '.centent-pre pre.preStyle',
+            questionType: '.letterSortNum',
+            fillInputs: '.input-ques .fillAnswer input.el-input__inner, .input-ques .fillAnswer textarea.el-textarea__inner',
+            optionNodes: '.el-radio, .el-checkbox, .option-item, .topic-option-item, ul.radio-view li',
+            optionTextNode: '.preStyle, .option-content, .stem',
+            optionClickableInput: '.el-radio__original, .el-checkbox__original, input[type="radio"], input[type="checkbox"]',
+            optionCheckedInputs: '.el-radio__input.is-checked, .el-checkbox__input.is-checked, input[type="radio"]:checked, input[type="checkbox"]:checked',
+            checkedFallback: '.el-radio__input.is-checked, .el-checkbox__input.is-checked, input[type="radio"]:checked, input[type="checkbox"]:checked, [aria-checked="true"], .option-item.active, .topic-option-item.active',
+            submitButton: '.reviewDone',
+            nextButton: '.next-topic.next-t',
+            answerCardFirstItem: '.answerCard .answer-item, .topic-list .topic-item, .card-list li, .answer-sheet li, .sheet-list li, .question-card li, .topic-card-item',
+            answerCardEntryCandidates: 'button, a, span, div, .el-button, [role="button"]',
+            answerCardFirstNumberCandidates: 'li, button, a, span, div',
+            dialogCancelButton: '.cancel.button, .el-button--default, .van-dialog__cancel',
+            dialogConfirmButton: '.comfirm.button, .el-button--primary, .van-dialog__confirm'
+        }),
+        pointPage: Object.freeze({
+            examPreviewLinks: 'a[href*="/examPreview/"]'
+        }),
+        previewPage: Object.freeze({
+            questionBlocks: '.questionContent, .question-item, .topic-item, .question-wrapper, .preview-question-item',
+            questionTitle: '.quest-title .option-name .inner-box, .quest-title .option-name, .quest-title, .centent-pre pre.preStyle, .question-title, .topic-title, .stem, .title',
+            referenceAnswerSpans: '.analysis .answer-title span, .answer-title span',
+            answerTitle: '.analysis .answer-title, .answer-title',
+            answerFallback: '.correct-answer, .right-answer, .analysis-answer, .answer-content, .answer, .answer-text',
+            checkedFallback: '.is-checked, .checked, input:checked',
+            errorResult: '.question-result.error'
+        })
+    });
     const LOG_BUFFER_MAX = 300;
     
     // 自定义AI设置相关的元素
@@ -100,8 +320,8 @@
     const apiModelInput = document.getElementById('ai-model');
     const saveSettingsBtn = document.getElementById('save-settings');
 
-    let isPanelVisible = GM_getValue('panel_visible_state', true); // 默认开启
-    let autoMode = GM_getValue('autoMode_state', false);
+    let isPanelVisible = storage.getGm(KEYS.gm.panelVisible, true); // 默认开启
+    let autoMode = storage.getGm(KEYS.gm.autoMode, false);
 
     // 初始化面板可见性
     if (isPanelVisible) {
@@ -113,10 +333,10 @@
     }
     
     // 读取持久化的AI设置
-    let savedProvider = GM_getValue('ai_provider', 'free');
-    let savedApiUrl = GM_getValue('ai_url', '');
-    let savedApiKey = GM_getValue('ai_key', '');
-    let savedApiModel = GM_getValue('ai_model', '');
+    let savedProvider = storage.getGm(KEYS.gm.aiProvider, 'free');
+    let savedApiUrl = storage.getGm(KEYS.gm.aiUrl, '');
+    let savedApiKey = storage.getGm(KEYS.gm.aiKey, '');
+    let savedApiModel = storage.getGm(KEYS.gm.aiModel, '');
 
     // 初始化UI状态
     providerSelect.value = savedProvider;
@@ -130,7 +350,7 @@
     // 监听切换和保存事件
     providerSelect.addEventListener('change', (e) => {
         savedProvider = e.target.value;
-        GM_setValue('ai_provider', savedProvider); // 切换时直接保存模式
+        storage.setGm(KEYS.gm.aiProvider, savedProvider); // 切换时直接保存模式
         
         if (savedProvider === 'custom') {
             customSettingsDiv.classList.remove('hidden');
@@ -152,9 +372,9 @@
             apiUrlInput.value = savedApiUrl; // 更新UI显示
         }
         
-        GM_setValue('ai_url', savedApiUrl);
-        GM_setValue('ai_key', savedApiKey);
-        GM_setValue('ai_model', savedApiModel);
+        storage.setGm(KEYS.gm.aiUrl, savedApiUrl);
+        storage.setGm(KEYS.gm.aiKey, savedApiKey);
+        storage.setGm(KEYS.gm.aiModel, savedApiModel);
         
         log(`自定义接口设置已保存!`);
     });
@@ -215,8 +435,8 @@
     document.addEventListener('mouseup', () => {
         if (isDragging) {
             isDragging = false;
-            GM_setValue('panel_pos_left', dragContainer.style.left);
-            GM_setValue('panel_pos_top', dragContainer.style.top);
+            storage.setGm(KEYS.gm.panelPosLeft, dragContainer.style.left);
+            storage.setGm(KEYS.gm.panelPosTop, dragContainer.style.top);
         }
     });
 
@@ -226,7 +446,7 @@
             return;
         }
         isPanelVisible = !isPanelVisible;
-        GM_setValue('panel_visible_state', isPanelVisible);
+        storage.setGm(KEYS.gm.panelVisible, isPanelVisible);
         panel.classList.toggle('show', isPanelVisible);
         toggleButton.textContent = isPanelVisible ? 'X' : 'AI';
     });
@@ -235,7 +455,7 @@
 
     // --- 4. 核心功能函数 ---
     function getLogBuffer() {
-        const value = GM_getValue(LOG_BUFFER_KEY, []);
+        const value = storage.getGm(KEYS.gm.runtimeLogBuffer, []);
         if (Array.isArray(value)) return value;
         try {
             const parsed = JSON.parse(value || '[]');
@@ -246,38 +466,107 @@
     }
 
     function saveLogBuffer(buffer) {
-        GM_setValue(LOG_BUFFER_KEY, buffer.slice(-LOG_BUFFER_MAX));
+        storage.setGm(KEYS.gm.runtimeLogBuffer, buffer.slice(-LOG_BUFFER_MAX));
     }
 
     function clearLogBuffer() {
-        GM_setValue(LOG_BUFFER_KEY, []);
+        storage.setGm(KEYS.gm.runtimeLogBuffer, []);
         statusLog.innerHTML = '';
+        logSeq = 0;
+    }
+
+    function normalizeCategory(category) {
+        const c = String(category || '').toUpperCase();
+        const alias = {
+            'FLOW': 'FLOW',
+            'NAV': 'FLOW',
+            'QUESTION': 'QUESTION',
+            'AI': 'AI',
+            'MEMORY': 'SYSTEM',
+            'SUBMIT': 'SUBMIT',
+            'SYSTEM': 'SYSTEM',
+            'SYS': 'SYSTEM',
+            'ERROR': 'ERROR'
+        };
+        return alias[c] || 'SYSTEM';
+    }
+
+    function categoryLabel(category) {
+        const c = normalizeCategory(category);
+        const labels = {
+            SYSTEM: '系统',
+            FLOW: '流程',
+            QUESTION: '题目',
+            AI: '模型',
+            SUBMIT: '提交',
+            ERROR: '错误'
+        };
+        return labels[c] || c;
+    }
+
+    function shortenText(text, maxLen = 100) {
+        const s = String(text || '').replace(/\s+/g, ' ').trim();
+        if (s.length <= maxLen) return s;
+        return `${s.slice(0, maxLen)}...`;
+    }
+
+    function normalizeLogMessage(message, category, level) {
+        const cat = normalizeCategory(category);
+        const lv = String(level || 'info').toLowerCase();
+        const msg = String(message || '').replace(/\s+/g, ' ').trim();
+
+        if (!msg) return '';
+
+        if (cat === 'QUESTION') {
+            if (msg.includes('处理题目')) return `题目处理中: ${shortenText(msg.replace(/^处理题目\s*\((.*?)\)\s*:\s*/,'[$1] '), 90)}`;
+            if (msg.includes('当前题已作答')) return `跳过已作答题: ${shortenText(msg.replace('当前题已作答，跳过AI', ''), 90)}`;
+            if (msg.includes('当前题未作答')) return `未作答，开始请求模型: ${shortenText(msg.replace(/^当前题未作答，准备调用AI[:：]?\s*/, ''), 90)}`;
+            if (msg.includes('选择答案')) return `已选择答案: ${msg.replace(/^选择答案[:：]?\s*/, '').trim()}`;
+        }
+
+        if (cat === 'AI') {
+            if (msg.includes('正在请求AI回答')) return msg.replace('正在请求AI回答', '请求模型');
+            if (msg.includes('连续3次失败')) return `模型重试失败: ${msg}`;
+        }
+
+        if (lv === 'debug') {
+            return shortenText(msg, 120);
+        }
+
+        return msg;
     }
 
     function renderLogEntry(entry) {
         const safeLevel = String(entry.level || 'info').toLowerCase();
         const safeTag = safeLevel.toUpperCase();
         const safeTime = entry.time || new Date().toLocaleTimeString();
+        const safeCat = normalizeCategory(entry.category);
+        const safeCatLabel = categoryLabel(safeCat);
         const safeMsg = String(entry.message || '');
-        statusLog.innerHTML += `<div class="log-${safeLevel}"><span class="time">[${safeTime}]</span><span class="level">[${safeTag}]</span>${safeMsg}</div>`;
+        const seqText = String(entry.seq || '').padStart(4, '0');
+        statusLog.innerHTML += `<div class="log-item cat-${safeCat.toLowerCase()} lv-${safeLevel}"><div class="log-head"><span class="seq">#${seqText}</span><span class="time">${safeTime}</span><span class="cat">${safeCatLabel}</span><span class="level">${safeTag}</span></div><div class="log-msg">${safeMsg}</div></div>`;
     }
 
     function renderLogBuffer() {
         statusLog.innerHTML = '';
         const buffer = getLogBuffer();
+        logSeq = buffer.reduce((maxSeq, item) => Math.max(maxSeq, Number(item?.seq || 0)), 0);
         for (const entry of buffer) {
             renderLogEntry(entry);
         }
         statusLog.scrollTop = statusLog.scrollHeight;
     }
 
-    function log(message, level = 'info') {
+    function log(message, level = 'info', category = 'SYSTEM') {
         const lv = String(level || 'info').toLowerCase();
         const levelTag = lv.toUpperCase();
-        console.log(`[AI脚本][${levelTag}] ${message}`);
+        const cat = normalizeCategory(category);
+        const normalizedMessage = normalizeLogMessage(message, cat, lv);
+        logSeq += 1;
+        console.log(`[AI脚本][#${String(logSeq).padStart(4, '0')}][${levelTag}][${cat}] ${normalizedMessage}`);
         const timestamp = new Date().toLocaleTimeString();
 
-        const entry = { time: timestamp, level: lv, message: message };
+        const entry = { seq: logSeq, time: timestamp, level: lv, category: cat, message: normalizedMessage };
         const buffer = getLogBuffer();
         buffer.push(entry);
         saveLogBuffer(buffer);
@@ -299,7 +588,7 @@
     }
 
     function findImproveButton() {
-        const selectors = ['.simplified-mastery__action', '.improve-btn', 'button', '.el-button', '.van-button'];
+        const selectors = SELECTORS.learnPage.improveButtonCandidates;
         for (const selector of selectors) {
             const nodes = document.querySelectorAll(selector);
             for (const node of nodes) {
@@ -346,17 +635,24 @@
         while (Date.now() < endTime) {
             const el = document.querySelector(selector);
             if (el) return el;
-            await new Promise(resolve => setTimeout(resolve, interval));
+            await delay(interval);
         }
         return null;
     }
 
-    const NO_IMPROVE_CACHE_KEY = 'no_improve_cache_v1';
-    const CHAPTER_QA_MEMORY_KEY = 'chapter_qa_memory_v1';
-    const CURRENT_CHAPTER_KEY = 'current_chapter_key_global_v1';
+    async function waitForUrlChange(startUrl, timeout = 8000, interval = 400) {
+        const endTime = Date.now() + timeout;
+        while (Date.now() < endTime) {
+            if (window.location.href !== startUrl) {
+                return true;
+            }
+            await delay(interval);
+        }
+        return false;
+    }
 
     function getNoImproveCache() {
-        const value = GM_getValue(NO_IMPROVE_CACHE_KEY, []);
+        const value = storage.getGm(KEYS.gm.noImproveCache, []);
         if (Array.isArray(value)) return value;
         try {
             const parsed = JSON.parse(value || '[]');
@@ -371,38 +667,38 @@
         const list = getNoImproveCache();
         if (list.includes(itemName)) return;
         list.push(itemName);
-        GM_setValue(NO_IMPROVE_CACHE_KEY, list);
+        storage.setGm(KEYS.gm.noImproveCache, list);
         log(`已加入永久缓存(无去提升): ${itemName}`);
     }
 
     function getCurrentLearnItemName() {
-        const node = document.querySelector('.title-text.active, .item-title.active, .section-item-collapse-info.active .title-text, .item-content.active .item-title');
+        const node = document.querySelector(SELECTORS.learnPage.activeItemName);
         if (!node) return '';
         return (node.textContent || node.innerText || '').trim();
     }
 
     function getCurrentChapterKey() {
-        const fromSession = sessionStorage.getItem('current_chapter_key') || '';
+        const fromSession = storage.getSession(KEYS.session.currentChapterKey, '');
         if (fromSession) return fromSession;
 
-        const fromGlobal = GM_getValue(CURRENT_CHAPTER_KEY, '');
+        const fromGlobal = storage.getGm(KEYS.gm.currentChapterKeyGlobal, '');
         if (fromGlobal) return fromGlobal;
 
         const nodeName = new URLSearchParams(window.location.search).get('nodeName') || '';
         if (nodeName) return decodeURIComponent(nodeName);
 
-        return sessionStorage.getItem('last_attempted_item') || '';
+        return storage.getSession(KEYS.session.lastAttemptedItem, '');
     }
 
     function setCurrentChapterKey(chapterKey) {
         const key = String(chapterKey || '').trim();
         if (!key) return;
-        sessionStorage.setItem('current_chapter_key', key);
-        GM_setValue(CURRENT_CHAPTER_KEY, key);
+        storage.setSession(KEYS.session.currentChapterKey, key);
+        storage.setGm(KEYS.gm.currentChapterKeyGlobal, key);
     }
 
     function getChapterQaMemory() {
-        const value = GM_getValue(CHAPTER_QA_MEMORY_KEY, {});
+        const value = storage.getGm(KEYS.gm.chapterQaMemory, {});
         if (value && typeof value === 'object' && !Array.isArray(value)) return value;
         try {
             const parsed = JSON.parse(value || '{}');
@@ -413,7 +709,7 @@
     }
 
     function saveChapterQaMemory(memory) {
-        GM_setValue(CHAPTER_QA_MEMORY_KEY, memory || {});
+        storage.setGm(KEYS.gm.chapterQaMemory, memory || {});
     }
 
     function replaceChapterQaRecords(chapterKey, records) {
@@ -447,9 +743,9 @@
         const list = Array.isArray(memory[chapterKey]) ? memory[chapterKey] : [];
         if (list.length === 0) return [];
 
-        const normalizedCurrent = normalizeTextForMatch(currentQuestion || '');
+        const normalizedCurrent = PureUtils.normalizeTextForMatch(currentQuestion || '');
         const scored = list.map(item => {
-            const nq = normalizeTextForMatch(item.q || '');
+            const nq = PureUtils.normalizeTextForMatch(item.q || '');
             let score = 0;
             if (normalizedCurrent && nq) {
                 if (normalizedCurrent.includes(nq) || nq.includes(normalizedCurrent)) {
@@ -467,13 +763,11 @@
     }
 
     function previewText(text, maxLen = 60) {
-        const s = String(text || '').replace(/\s+/g, ' ').trim();
-        if (s.length <= maxLen) return s;
-        return `${s.slice(0, maxLen)}...`;
+        return PureUtils.previewText(text, maxLen);
     }
 
     function findClickableByText(keywords) {
-        const candidates = document.querySelectorAll('a, button, .el-button, .van-button, [role="button"], span, div');
+        const candidates = document.querySelectorAll(SELECTORS.common.clickable);
         for (const el of candidates) {
             if (!isElementVisible(el)) continue;
             const text = (el.textContent || el.innerText || '').replace(/\s+/g, '');
@@ -487,7 +781,7 @@
     }
 
     function findExamPreviewUrlFromPage() {
-        const links = document.querySelectorAll('a[href*="/examPreview/"]');
+        const links = document.querySelectorAll(SELECTORS.pointPage.examPreviewLinks);
         for (const a of links) {
             const href = a.getAttribute('href') || '';
             if (!href) continue;
@@ -513,96 +807,75 @@
     }
 
     function goToCourseList(reason) {
-        if (reason) log(reason);
-        const courseUrl = sessionStorage.getItem('course_list_url');
+        const courseUrl = storage.getSession(KEYS.session.courseListUrl, '');
         if (courseUrl) {
-            log('返回课程主页(singleCourse)继续筛选...');
-            window.location.href = courseUrl;
-        } else {
-            log('未记录课程主页URL，请手动回到课程页。');
+            navigateTo(courseUrl, reason || '返回课程主页(singleCourse)继续筛选...', 'FLOW');
+            return;
         }
+
+        if (reason) log(reason, 'warn', 'FLOW');
+        log('未记录课程主页URL，请手动回到课程页。', 'warn', 'FLOW');
     }
 
-    function isQuestionAnswered(qContent) {
-        if (!qContent) return false;
-
-        const fillInputs = qContent.querySelectorAll('.input-ques .fillAnswer input.el-input__inner, .input-ques .fillAnswer textarea.el-textarea__inner, input[type="text"], textarea');
-        if (fillInputs.length > 0) {
-            for (const input of fillInputs) {
-                if (!input.value || input.value.trim() === '') return false;
-            }
+    function isOptionNodeChecked(optionNode) {
+        if (!optionNode) return false;
+        if (optionNode.classList.contains('is-checked') || optionNode.classList.contains('checked') || optionNode.classList.contains('selected') || optionNode.classList.contains('active')) {
             return true;
         }
-
-        const checkedOptions = qContent.querySelectorAll('.is-checked, input[type="radio"]:checked, input[type="checkbox"]:checked');
-        if (checkedOptions.length > 0) return true;
-
+        if (optionNode.querySelector(SELECTORS.testPage.optionCheckedInputs)) {
+            return true;
+        }
         return false;
     }
 
-    function normalizeFullWidthLetters(text) {
-        return String(text || '').replace(/[Ａ-Ｚ]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 65248));
+    function areFillAnswersApplied(inputs, answers) {
+        if (!inputs || inputs.length === 0) return false;
+        for (let i = 0; i < inputs.length; i++) {
+            const expected = String(answers?.[i] || '').trim();
+            if (!expected) continue;
+            const current = String(inputs[i].value || inputs[i].getAttribute('value') || '').trim();
+            if (!current) return false;
+        }
+        return true;
     }
 
-    function normalizeTextForMatch(text) {
-        return String(text || '')
-            .toLowerCase()
-            .replace(/\s+/g, '')
-            .replace(/[，。、“”‘’【】（）()《》：:；;,.!?！？'"`]/g, '');
+    function areExpectedOptionsSelected(qContent, answerLetters) {
+        const optionNodes = qContent.querySelectorAll(SELECTORS.testPage.optionNodes);
+        if (!optionNodes || optionNodes.length === 0) return false;
+        for (const char of String(answerLetters || '')) {
+            const idx = char.charCodeAt(0) - 65;
+            if (idx < 0 || idx >= optionNodes.length) return false;
+            if (!isOptionNodeChecked(optionNodes[idx])) return false;
+        }
+        return true;
     }
 
-    function parseChoiceAnswer(rawContent, options, type) {
-        let text = normalizeFullWidthLetters(rawContent).trim();
-
-        if (type.includes('判断')) {
-            if (/对|正确|\btrue\b|\bT\b|√/i.test(text)) return 'A';
-            if (/错|错误|\bfalse\b|\bF\b|×/i.test(text)) return 'B';
-        }
-
-        let letters = text.toUpperCase().replace(/[^A-Z]/g, '');
-
-        if (!letters && options && options.length > 0) {
-            const normalizedReply = normalizeTextForMatch(text);
-            let matched = '';
-            options.forEach((opt, index) => {
-                const normOpt = normalizeTextForMatch(opt);
-                if (normOpt && normalizedReply.includes(normOpt)) {
-                    matched += String.fromCharCode(65 + index);
-                }
-            });
-            letters = matched;
-        }
-
-        const maxLetters = options ? options.length : 4;
-        const result = [];
-        for (const ch of letters) {
-            const idx = ch.charCodeAt(0) - 65;
-            if (idx >= 0 && idx < maxLetters && !result.includes(ch)) {
-                result.push(ch);
+    function isQuestionAnsweredByType(qContent, qTypeText) {
+        if (!qContent) return false;
+        if (String(qTypeText || '').includes('填空')) {
+            const inputs = qContent.querySelectorAll(SELECTORS.testPage.fillInputs);
+            if (inputs.length === 0) return false;
+            for (const input of inputs) {
+                const v = String(input.value || input.getAttribute('value') || '').trim();
+                if (!v) return false;
             }
+            return true;
         }
-
-        if (result.length === 0) return null;
-        if (type.includes('单选') || type.includes('判断')) return result[0];
-        return result.join('');
-    }
-
-    function parseFillAnswer(rawContent) {
-        let text = String(rawContent || '').trim();
-        text = text.replace(/^答案[:：]?\s*/i, '');
-        text = text.replace(/^填空答案[:：]?\s*/i, '');
-        text = text.replace(/\r?\n+/g, '||');
-        return text || null;
+        const optionNodes = qContent.querySelectorAll(SELECTORS.testPage.optionNodes);
+        if (optionNodes.length === 0) return false;
+        return Array.from(optionNodes).some(isOptionNodeChecked);
     }
 
     function buildAiMessages(question, options, type, safeMode = false, chapterHints = []) {
         const q = String(question || '').replace(/\s+/g, ' ').trim();
+        const isFill = type.includes('填空');
+        const expectedFillCount = isFill ? Math.max(1, (q.match(/_{2,}|___|（\s*\)|\(\s*\)/g) || []).length) : 0;
         const optionText = (options || [])
             .map((opt, i) => `${String.fromCharCode(65 + i)}. ${String(opt || '').replace(/\s+/g, ' ').trim()}`)
             .join('\n');
 
-        const baseRules = type.includes('填空')
-            ? '只输出填空答案；多空用||分隔；禁止解释。'
+        const baseRules = isFill
+            ? `只输出填空答案；多空用||分隔；必须输出${expectedFillCount}个答案；禁止解释。`
             : '只输出选项字母；单选/判断输出一个字母，多选输出连续字母；禁止解释。';
 
         const safetyLine = safeMode
@@ -617,12 +890,13 @@
             : '';
 
         return [
-            { role: 'system', content: '你是客观题答题助手，只返回最终答案，不要解释。' },
+            { role: 'system', content: '你是客观题答题助手。严格只返回答案本体，不要解释、不要多余字符、不要复述题目。' },
             {
                 role: 'user',
                 content: [
                     `题型: ${type}`,
                     `规则: ${baseRules}`,
+                    isFill ? `填空数量: ${expectedFillCount}` : '',
                     safetyLine,
                     hintBlock,
                     `题目: ${q}`,
@@ -632,15 +906,16 @@
         ];
     }
 
-    function callAiApi(question, options, type, safeMode = false, chapterHints = []) {
+    function callAiApi(question, options, type, safeMode = false, chapterHints = [], providerOverride = null) {
         return new Promise((resolve) => {
             const messages = buildAiMessages(question, options, type, safeMode, chapterHints);
 
             let url, headers, data;
+            const providerToUse = providerOverride || savedProvider;
 
-            if (savedProvider === 'custom') {
+            if (providerToUse === 'custom') {
                 if (!savedApiUrl || !savedApiKey || !savedApiModel) {
-                    log('错误：自定义AI接口的URL、Key或Model为空，请在面板中设置并保存。', 'error');
+                    log('错误：自定义AI接口的URL、Key或Model为空，请在面板中设置并保存。', 'error', 'AI');
                     resolve({ answer: null, errorType: 'config' });
                     return;
                 }
@@ -654,12 +929,12 @@
                     messages: messages,
                     temperature: 0.1
                 });
-                log(`正在请求AI回答 (${savedApiModel})...`);
+                log(`正在请求AI回答 (${savedApiModel})...`, 'info', 'AI');
             } else {
                 url = 'https://api.coren.xin/zhipu-free-proxy';
                 headers = { 'Content-Type': 'application/json' };
                 data = JSON.stringify({ messages: messages });
-                log('正在请求AI回答 (免费模型 GLM-4.5-Flash)...');
+                log('正在请求AI回答 (免费模型 GLM-4.5-Flash)...', 'info', 'AI');
             }
 
             GM_xmlhttpRequest({
@@ -681,11 +956,11 @@
 
                             let parsedAnswer = null;
                             if (type.includes('填空')) {
-                                parsedAnswer = parseFillAnswer(content);
-                                log(`AI 填空题回答: ${parsedAnswer || '(空)'}`);
+                                parsedAnswer = PureUtils.normalizeFillAnswerByQuestion(question, content);
+                                log(`AI 填空题回答: ${parsedAnswer || '(空)'}`, 'info', 'AI');
                             } else {
-                                parsedAnswer = parseChoiceAnswer(content, options, type);
-                                log(`AI 回答: ${parsedAnswer || '(无法解析)'}`);
+                                parsedAnswer = PureUtils.parseChoiceAnswer(content, options, type);
+                                log(`AI 回答: ${parsedAnswer || '(无法解析)'}`, 'info', 'AI');
                             }
 
                             resolve({ answer: parsedAnswer, errorType: parsedAnswer ? null : 'parse' });
@@ -700,7 +975,7 @@
                             errorMsg = errorData.error?.message || errorData.message || errorMsg;
                         } catch (e) {}
 
-                        log(`API 请求失败: ${response.status} - ${errorMsg}`);
+                        log(`API 请求失败: ${response.status} - ${errorMsg}`, 'warn', 'AI');
 
                         let errorType = 'http';
                         if (response.status === 429) errorType = 'rate_limit';
@@ -711,44 +986,81 @@
                     }
                 },
                 onerror: (error) => {
-                    log(`API 调用出错: ${error.statusText || '网络错误'}`);
+                    log(`API 调用出错: ${error.statusText || '网络错误'}`, 'warn', 'AI');
                     resolve({ answer: null, errorType: 'network' });
                 },
                 ontimeout: () => {
-                    log('API 请求超时 (15秒)。');
+                    log('API 请求超时 (15秒)。', 'warn', 'AI');
                     resolve({ answer: null, errorType: 'timeout' });
                 }
             });
         });
     }
 
-    // --- 总的答案获取调度函数 ---
-    async function getAnswer(question, options, type, retries = 3) {
-        let safeMode = false;
+    async function getAnswer(question, options, type) {
         const chapterKey = getCurrentChapterKey();
-        log(`当前答题章节Key: ${chapterKey || '(空)'}`, 'debug');
+        log(`当前章节: ${chapterKey || '(空)'}`, 'debug', 'MEMORY');
         const chapterHints = getChapterQaHints(chapterKey, question, 8);
         if (chapterHints.length > 0) {
-            log(`已注入同章节历史答案参考 ${chapterHints.length} 条。`, 'debug');
+            log(`注入历史参考 ${chapterHints.length} 条。`, 'debug', 'MEMORY');
             chapterHints.forEach((h, idx) => {
-                log(`提示样例${idx + 1}: 题="${previewText(h.q, 44)}" -> 答="${previewText(h.a, 30)}"`, 'debug');
+                log(`提示样例${idx + 1}: 题="${previewText(h.q, 44)}" -> 答="${previewText(h.a, 30)}"`, 'debug', 'MEMORY');
             });
         } else {
-            log('当前题未命中章节记忆库提示。', 'debug');
+            log('当前题未命中历史参考。', 'debug', 'MEMORY');
         }
-        for (let i = 0; i < retries; i++) {
-            const result = await callAiApi(question, options, type, safeMode, chapterHints);
-            if (result.answer) return result.answer;
 
-            if (result.errorType === 'sensitive') {
-                safeMode = true;
-                log('检测到敏感拦截，已切换到更保守的提示词重试...', 'warn');
+        async function tryProvider(provider, attempts) {
+            let safeMode = false;
+            const providerLabel = provider === 'custom' ? '自定义模型' : '免费模型';
+
+            const finalResult = await retryAsync(
+                async (attempt) => {
+                    const apiResult = await callAiApi(question, options, type, safeMode, chapterHints, provider);
+                    if (apiResult.errorType === 'sensitive') {
+                        safeMode = true;
+                    }
+                    if (apiResult.answer) {
+                        return createResult(true, 'answer_ok', { answer: apiResult.answer, errorType: null });
+                    }
+                    return createResult(false, apiResult.errorType || 'unknown', { answer: null, errorType: apiResult.errorType || 'unknown' });
+                },
+                {
+                    attempts,
+                    shouldRetry: (result, attempt) => {
+                        const failed = !result.ok;
+                        if (failed && attempt < attempts) {
+                            log(`${providerLabel} 第 ${attempt} 次失败，继续重试...`, 'warn', 'AI');
+                        }
+                        return failed && attempt < attempts;
+                    },
+                    getDelayMs: (result) => result?.data?.errorType === 'rate_limit' ? 4500 : 1500
+                }
+            );
+
+            if (finalResult.ok) {
+                return { answer: finalResult.data.answer, ok: true };
             }
-
-            const waitMs = result.errorType === 'rate_limit' ? 4500 : 2000;
-            log(`AI 第 ${i + 1} 次尝试失败，准备重试...`, 'warn');
-            await new Promise(r => setTimeout(r, waitMs));
+            return { answer: null, ok: false };
         }
+
+        if (savedProvider === 'custom') {
+            const r = await tryProvider('custom', 3);
+            if (r.ok) return r.answer;
+            log('自定义模式下连续3次未收到有效答案，已中止。', 'error', 'AI');
+            toggleAutoMode(false);
+            return null;
+        }
+
+        const free = await tryProvider('free', 3);
+        if (free.ok) return free.answer;
+
+        log('免费模型连续3次失败，本题切换到自定义模型兜底。', 'warn', 'AI');
+        const custom = await tryProvider('custom', 3);
+        if (custom.ok) return custom.answer;
+
+        log('免费+自定义均连续3次失败，已中止。', 'error', 'AI');
+        toggleAutoMode(false);
         return null;
     }
 
@@ -756,56 +1068,58 @@
     // --- 6. 页面处理逻辑 ---
     async function processTestPage() {
         log("进入答题页面，等待题目加载...");
-        let pass = 1;
         let lastSubmitAt = 0;
 
         async function trySubmitCheck(tag) {
             if (Date.now() - lastSubmitAt < 5000) return false;
-            const submitButton = await waitForElement('.reviewDone', 3000);
+            const submitButton = await waitForElement(SELECTORS.testPage.submitButton, 3000);
             if (!submitButton) return false;
 
             reliableClick(submitButton);
             lastSubmitAt = Date.now();
-            log(`提交检查(${tag})`, 'debug');
+            log(`提交检查: ${tag}`, 'debug', 'SUBMIT');
 
             const startUrl = window.location.href;
             const end = Date.now() + 6000;
             while (Date.now() < end) {
                 if (!window.location.href.includes('/studentReviewTestOrExam/')) {
-                    log('提交成功并已跳转。');
+                    log('提交成功并已跳转。', 'success', 'SUBMIT');
                     return true;
                 }
 
-                const dialog = Array.from(document.querySelectorAll('.el-dialog__wrapper, .el-message-box__wrapper, .van-dialog'))
+                const dialog = Array.from(document.querySelectorAll(SELECTORS.common.dialogWrappers))
                     .find(d => d.style.display !== 'none' && getComputedStyle(d).display !== 'none');
                 if (dialog) {
                     const t = dialog.innerText || '';
                     if (t.includes('未作答') || t.includes('未完成') || t.includes('还有') || t.includes('空白')) {
-                        const cancelBtn = dialog.querySelector('.cancel.button') || dialog.querySelector('.el-button--default') || dialog.querySelector('.van-dialog__cancel');
+                        const cancelBtn = dialog.querySelector(SELECTORS.testPage.dialogCancelButton);
                         if (cancelBtn) reliableClick(cancelBtn);
+                        log('网站提示仍有未作答，继续下一轮。', 'warn', 'SUBMIT');
                         return false;
                     }
-                    const confirmBtn = dialog.querySelector('.comfirm.button') || dialog.querySelector('.el-button--primary') || dialog.querySelector('.van-dialog__confirm');
+                    const confirmBtn = dialog.querySelector(SELECTORS.testPage.dialogConfirmButton);
                     if (confirmBtn) {
                         reliableClick(confirmBtn);
+                        log('提交确认弹窗已确认。', 'success', 'SUBMIT');
                         return true;
                     }
                 }
-                await new Promise(r => setTimeout(r, 250));
+                await delay(250);
             }
 
+            log('提交检查未收到明确反馈，继续流程。', 'debug', 'SUBMIT');
             return window.location.href !== startUrl;
         }
 
         async function gotoFirstQuestion() {
-            const byCard = document.querySelector('.answerCard .answer-item, .topic-list .topic-item, .card-list li, .answer-sheet li, .sheet-list li, .question-card li, .topic-card-item');
+            const byCard = document.querySelector(SELECTORS.testPage.answerCardFirstItem);
             if (byCard) {
                 reliableClick(byCard);
-                await new Promise(r => setTimeout(r, 700));
+                await delay(700);
                 return true;
             }
 
-            const cardEntry = Array.from(document.querySelectorAll('button, a, span, div, .el-button, [role="button"]')).find(el => {
+            const cardEntry = Array.from(document.querySelectorAll(SELECTORS.testPage.answerCardEntryCandidates)).find(el => {
                 if (!isElementVisible(el)) return false;
                 const txt = (el.textContent || '').replace(/\s+/g, '');
                 return txt.includes('答题卡');
@@ -813,90 +1127,153 @@
             if (!cardEntry) return false;
 
             reliableClick(cardEntry);
-            await new Promise(r => setTimeout(r, 500));
-            const first = Array.from(document.querySelectorAll('li, button, a, span, div')).find(el => {
+            await delay(500);
+            const first = Array.from(document.querySelectorAll(SELECTORS.testPage.answerCardFirstNumberCandidates)).find(el => {
                 if (!isElementVisible(el)) return false;
                 const txt = (el.textContent || '').trim();
                 return txt === '1' || txt === '1.' || txt === '1、';
             });
             if (!first) return false;
             reliableClick(first);
-            await new Promise(r => setTimeout(r, 700));
+            await delay(700);
             return true;
         }
 
-        async function answerCurrentQuestion() {
-            const qContent = await waitForElement('.questionContent', 10000);
-            if (!qContent) return false;
+        async function answerCurrentQuestion(qContent) {
+            if (!qContent) return { status: 'none' };
 
-            if (isQuestionAnswered(qContent)) {
-                log('当前题目已作答，跳过。');
-                return true;
+            // 再等一点，避免切题瞬间 DOM 还没同步导致误判未作答
+            await delay(250);
+
+            const qTitle = qContent.querySelector(SELECTORS.testPage.questionTitle)?.innerText.trim() || '';
+            const qTypeText = qContent.querySelector(SELECTORS.testPage.questionType)?.innerText.trim() || '未知题型';
+            if (!qTitle) return { status: 'none' };
+
+            if (isQuestionAnsweredByType(qContent, qTypeText)) {
+                log('当前题检测到已有答案，执行覆盖式作答以确保稳定。', 'debug', 'QUESTION');
             }
 
-            const qTitle = qContent.querySelector('.centent-pre pre.preStyle')?.innerText.trim() || '';
-            const qTypeText = qContent.querySelector('.letterSortNum')?.innerText.trim() || '未知题型';
-            if (!qTitle) return false;
-
-            log(`处理题目 (${qTypeText}): ${qTitle}`);
+            log(`处理题目 (${qTypeText}): ${qTitle}`, 'info', 'QUESTION');
 
             if (qTypeText.includes('填空')) {
-                const inputs = qContent.querySelectorAll('.input-ques .fillAnswer input.el-input__inner, .input-ques .fillAnswer textarea.el-textarea__inner');
-                if (inputs.length === 0) return false;
-                const ansStr = await getAnswer(qTitle + ' (按顺序返回每空答案，多空用||分隔)', [], '填空题', 1);
-                if (!ansStr) return false;
+                const inputs = qContent.querySelectorAll(SELECTORS.testPage.fillInputs);
+                if (inputs.length === 0) return { status: 'none' };
+                const ansStr = await getAnswer(qTitle + ' (按顺序返回每空答案，多空用||分隔)', [], '填空题');
+                if (!ansStr) return { status: 'none' };
                 const ansList = ansStr.split('||').map(s => s.trim());
-                for (let i = 0; i < inputs.length; i++) {
-                    if (!ansList[i]) continue;
-                    setInputValueReliably(inputs[i], ansList[i]);
-                    await new Promise(r => setTimeout(r, 100));
+                for (let round = 1; round <= 2; round++) {
+                    for (let i = 0; i < inputs.length; i++) {
+                        if (!ansList[i]) continue;
+                        log(`填入第 ${i + 1} 空: ${ansList[i]}${round > 1 ? ' (重试)' : ''}`, 'info', 'QUESTION');
+                        setInputValueReliably(inputs[i], ansList[i]);
+                        await delay(120);
+                    }
+                    await delay(220);
+                    if (areFillAnswersApplied(inputs, ansList)) {
+                        return { status: 'filled', stable: true };
+                    }
                 }
-                return true;
+                log('填空答案回读不稳定，已按当前结果继续。', 'warn', 'QUESTION');
+                return { status: 'filled', stable: false };
             }
 
-            const optionNodes = qContent.querySelectorAll('.el-radio, .el-checkbox, .option-item, .topic-option-item, ul.radio-view li');
-            if (optionNodes.length === 0) return false;
+            const optionNodes = qContent.querySelectorAll(SELECTORS.testPage.optionNodes);
+            if (optionNodes.length === 0) return { status: 'none' };
             const optionsText = Array.from(optionNodes).map(el => {
-                const preNode = el.querySelector('.preStyle') || el.querySelector('.option-content') || el.querySelector('.stem');
+                const preNode = el.querySelector(SELECTORS.testPage.optionTextNode);
                 return preNode ? preNode.innerText.trim() : el.innerText.trim();
             });
-            const answer = await getAnswer(qTitle, optionsText, qTypeText, 1);
-            if (!answer) return false;
+            const answer = await getAnswer(qTitle, optionsText, qTypeText);
+            if (!answer) return { status: 'none' };
+            log(`选择答案: ${answer}`, 'info', 'QUESTION');
 
-            for (const char of answer) {
-                const idx = char.charCodeAt(0) - 65;
-                if (idx < 0 || idx >= optionNodes.length) continue;
-                const inputElement = optionNodes[idx].querySelector('.el-radio__original, .el-checkbox__original, input[type="radio"], input[type="checkbox"]') || optionNodes[idx];
-                reliableClick(inputElement);
-                await new Promise(r => setTimeout(r, 120));
+            const answerChars = String(answer || '').split('');
+            for (let round = 1; round <= 2; round++) {
+                for (const char of answerChars) {
+                    const idx = char.charCodeAt(0) - 65;
+                    if (idx < 0 || idx >= optionNodes.length) continue;
+                    if (isOptionNodeChecked(optionNodes[idx])) continue;
+
+                    const inputElement = optionNodes[idx].querySelector(SELECTORS.testPage.optionClickableInput) || optionNodes[idx];
+                    reliableClick(inputElement);
+                    await delay(150);
+                }
+
+                await delay(220);
+                if (areExpectedOptionsSelected(qContent, answer)) {
+                    return { status: 'filled', stable: true };
+                }
             }
-            return true;
+
+            log('选项回读不稳定，已按当前结果继续。', 'warn', 'QUESTION');
+            return { status: 'filled', stable: false };
         }
 
+        await gotoFirstQuestion();
+
         while (autoMode) {
-            const answered = await answerCurrentQuestion();
-
-            if (pass >= 2 && answered) {
-                const done = await trySubmitCheck(`pass-${pass}`);
-                if (done) return;
+            const qContent = await waitForElement(SELECTORS.testPage.questionContent, 8000);
+            if (!qContent) {
+                log('未加载到题目区域，结束本轮。', 'warn', 'QUESTION');
+                break;
             }
 
-            const nextBtn = document.querySelector('.next-topic.next-t');
-            if (nextBtn) {
-                reliableClick(nextBtn);
-                await new Promise(r => setTimeout(r, 650));
-                continue;
+            const questionPreview = (qContent.querySelector(SELECTORS.testPage.questionTitle)?.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 28);
+            log(`开始作答当前题${questionPreview ? `: ${questionPreview}...` : ''}`, 'debug', 'QUESTION');
+            const result = await answerCurrentQuestion(qContent);
+            if (result?.status === 'none') {
+                log('当前题未完成有效作答，尝试继续流程。', 'warn', 'QUESTION');
             }
 
-            const jumped = await gotoFirstQuestion();
-            if (jumped) {
-                pass++;
-                log(`开始第 ${pass} 轮循环`, 'debug');
-                await new Promise(r => setTimeout(r, 500));
-                continue;
+            const nextBtn = document.querySelector(SELECTORS.testPage.nextButton);
+            if (!nextBtn) {
+                log('已到最后一题，开始提交。', 'info', 'SUBMIT');
+                break;
             }
 
-            await new Promise(r => setTimeout(r, 1000));
+            log('点击下一题。', 'info', 'NAV');
+            reliableClick(nextBtn);
+            await delay(650);
+        }
+
+        if (autoMode) {
+            const done = await trySubmitCheck('顺序答题完成');
+            if (!done) {
+                log('提交未成功，返回第一题重做一轮。', 'warn', 'SUBMIT');
+                const restarted = await gotoFirstQuestion();
+                if (restarted) {
+                    while (autoMode) {
+                        const qContent = await waitForElement(SELECTORS.testPage.questionContent, 8000);
+                        if (!qContent) {
+                            log('重做轮未加载到题目区域，结束。', 'warn', 'QUESTION');
+                            break;
+                        }
+
+                        const questionPreview = (qContent.querySelector(SELECTORS.testPage.questionTitle)?.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 28);
+                        log(`重做当前题${questionPreview ? `: ${questionPreview}...` : ''}`, 'debug', 'QUESTION');
+                        const result = await answerCurrentQuestion(qContent);
+                        if (result?.status === 'none') {
+                            log('重做轮当前题未完成有效作答，继续后续流程。', 'warn', 'QUESTION');
+                        }
+
+                        const nextBtn = document.querySelector(SELECTORS.testPage.nextButton);
+                        if (!nextBtn) {
+                            log('重做轮到达最后一题，尝试再次提交。', 'info', 'SUBMIT');
+                            break;
+                        }
+
+                        reliableClick(nextBtn);
+                        await delay(650);
+                    }
+
+                    const done2 = await trySubmitCheck('重做轮完成');
+                    if (!done2) {
+                        log('重做轮提交仍未得到明确反馈。', 'warn', 'SUBMIT');
+                    }
+                } else {
+                    log('无法回到第一题，重做轮未执行。', 'warn', 'SUBMIT');
+                }
+            }
         }
     }
 
@@ -905,14 +1282,14 @@
     // 主页逻辑：自动悬停并点击"提升掌握度"按钮
     async function findAndScrollToIncompleteItem() {
         log("正在等待课程列表加载...");
-        const foundItems = await waitForElement('.item-content', 15000);
+        const foundItems = await waitForElement(SELECTORS.learnPage.itemContent, 15000);
         if (!foundItems) {
             log("未能找到知识点列表，可能当前页面不是课程主页或网络极慢。");
             return;
         }
-        await new Promise(r => setTimeout(r, 1000)); // 给它一点时间渲染进度条
+        await delay(1000); // 给它一点时间渲染进度条
         
-        const items = document.querySelectorAll('.item-content');
+        const items = document.querySelectorAll(SELECTORS.learnPage.itemContent);
         log(`找到 ${items.length} 个知识点项`);
         
         let validItems = [];
@@ -920,14 +1297,14 @@
         const noImproveCache = getNoImproveCache();
 
         for(let item of items) {
-            const pctNode = item.querySelector('.el-progress__text span');
+            const pctNode = item.querySelector(SELECTORS.learnPage.progressText);
             let pct = 0;
             if(pctNode) {
                 const parsed = parseInt(pctNode.innerText.trim(), 10);
                 if(!isNaN(parsed)) pct = parsed;
             }
             
-            const titleNode = item.querySelector('.item-title');
+            const titleNode = item.querySelector(SELECTORS.learnPage.itemTitle);
             const itemName = titleNode ? titleNode.innerText.trim() : ('未知知识点' + index);
 
             if(pct < 100 && !noImproveCache.includes(itemName)) {
@@ -949,13 +1326,13 @@
             const itemName = target.name;
 
             log(`优先级最高目标: "${itemName}" (掌握度: ${target.pct}%)，准备点击`);
-            sessionStorage.setItem('last_attempted_item', itemName);
+            storage.setSession(KEYS.session.lastAttemptedItem, itemName);
             setCurrentChapterKey(itemName);
             
             targetItem.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            await new Promise(r => setTimeout(r, 500));
+            await delay(500);
             
-            const titleNode = targetItem.querySelector('.item-title');
+            const titleNode = targetItem.querySelector(SELECTORS.learnPage.itemTitle);
             if(titleNode) {
                 reliableClick(titleNode);
             } else {
@@ -981,13 +1358,13 @@
         while (Date.now() < timeout) {
             btn = findImproveButton();
             if (btn) break;
-            await new Promise(r => setTimeout(r, 500));
+            await delay(500);
         }
 
         if (btn) {
             const currentItemName = getCurrentLearnItemName();
             if (currentItemName) {
-                sessionStorage.setItem('last_attempted_item', currentItemName);
+                storage.setSession(KEYS.session.lastAttemptedItem, currentItemName);
             }
             const btnText = (btn.textContent || btn.innerText || '').trim();
             log(`找到可点击按钮: "${btnText}"，准备点击...`, 'debug');
@@ -995,7 +1372,7 @@
             return;
         }
 
-        const currentItemName = getCurrentLearnItemName() || sessionStorage.getItem('last_attempted_item') || '';
+        const currentItemName = getCurrentLearnItemName() || storage.getSession(KEYS.session.lastAttemptedItem, '') || '';
         if (currentItemName) {
             addToNoImproveCache(currentItemName);
         } else {
@@ -1006,8 +1383,8 @@
 
     async function processMasteryHistory() {
         log("进入历史掌握度页面，寻找「去提升」按钮...");
-        await new Promise(r => setTimeout(r, 2000));
-        const btn = document.querySelector('.improve-btn');
+        await delay(2000);
+        const btn = document.querySelector(SELECTORS.learnPage.improveButtonDirect);
         if(btn) {
             log("找到「去提升」按钮，准备点击...");
             reliableClick(btn);
@@ -1019,20 +1396,18 @@
 
     async function processPointPage() {
         log("进入知识点结算页面，等待成绩加载...");
-        await new Promise(r => setTimeout(r, 2000)); // 给点时间看成绩
+        await delay(2000); // 给点时间看成绩
 
         // 优先按URL规则直接构造解析页地址，避免按钮点击失效导致卡住
         const derivedPreviewUrl = buildExamPreviewUrlFromPointUrl();
         if (derivedPreviewUrl) {
-            log('已根据 point 链接构造 examPreview 地址，准备直接跳转采集...', 'debug');
-            window.location.href = derivedPreviewUrl;
+            navigateTo(derivedPreviewUrl, '已根据 point 链接构造 examPreview 地址，准备直接跳转采集...', 'NAV');
             return;
         }
 
         const directPreviewUrl = findExamPreviewUrlFromPage();
         if (directPreviewUrl) {
-            log('检测到解析页直达链接，准备直接跳转采集...', 'debug');
-            window.location.href = directPreviewUrl;
+            navigateTo(directPreviewUrl, '检测到解析页直达链接，准备直接跳转采集...', 'NAV');
             return;
         }
 
@@ -1040,22 +1415,16 @@
         if (previewBtn) {
             log('检测到可查看作答记录入口，准备采集题目与答案用于后续同章节增强。', 'debug');
             reliableClick(previewBtn);
-            // 防止点击无效：等待跳转，超时后回课程主页避免卡死
-            const startUrl = window.location.href;
-            const timeout = Date.now() + 8000;
-            while (Date.now() < timeout) {
-                if (window.location.href !== startUrl) return;
-                await new Promise(r => setTimeout(r, 400));
-            }
+            const changed = await waitForUrlChange(window.location.href, 8000, 400);
+            if (changed) return;
             log('点击查看作答记录后未发生跳转，可能入口不可点击，回课程主页继续。', 'warn');
             goToCourseList('结算页采集入口点击无效，回 singleCourse 继续执行...');
             return;
         }
 
-        const fallbackPreviewUrl = sessionStorage.getItem('last_exam_preview_url') || '';
+        const fallbackPreviewUrl = storage.getSession(KEYS.session.lastExamPreviewUrl, '');
         if (fallbackPreviewUrl) {
-            log('当前页未找到解析入口，尝试使用历史解析链接进行采集...', 'warn');
-            window.location.href = fallbackPreviewUrl;
+            navigateTo(fallbackPreviewUrl, '当前页未找到解析入口，尝试使用历史解析链接进行采集...', 'NAV');
             return;
         }
 
@@ -1065,22 +1434,22 @@
     async function processExamPreviewPage() {
         const chapterKey = getCurrentChapterKey();
         if (chapterKey) setCurrentChapterKey(chapterKey);
-        sessionStorage.setItem('last_exam_preview_url', window.location.href);
+        storage.setSession(KEYS.session.lastExamPreviewUrl, window.location.href);
         log(`进入答题解析页，开始提取题目答案记录...${chapterKey ? ` (章节: ${chapterKey})` : ''}`, 'debug');
-        await new Promise(r => setTimeout(r, 2000));
+        await delay(2000);
 
-        const questionBlocks = document.querySelectorAll('.questionContent, .question-item, .topic-item, .question-wrapper, .preview-question-item');
+        const questionBlocks = document.querySelectorAll(SELECTORS.previewPage.questionBlocks);
         const extractedRecords = [];
 
         const normalizeLine = (s) => String(s || '').replace(/\s+/g, ' ').trim();
         const cleanQuestion = (s) => normalizeLine(s).replace(/^\d+[、.．]\s*/, '');
 
         questionBlocks.forEach(block => {
-            const qNode = block.querySelector('.quest-title .option-name .inner-box, .quest-title .option-name, .quest-title, .centent-pre pre.preStyle, .question-title, .topic-title, .stem, .title');
+            const qNode = block.querySelector(SELECTORS.previewPage.questionTitle);
             const q = qNode ? cleanQuestion(qNode.textContent || qNode.innerText || '') : '';
 
             // 优先提取“参考答案”，避免把用户错误作答写入记忆库
-            const referenceAnswerSpans = block.querySelectorAll('.analysis .answer-title span, .answer-title span');
+            const referenceAnswerSpans = block.querySelectorAll(SELECTORS.previewPage.referenceAnswerSpans);
             let a = '';
             if (referenceAnswerSpans.length > 0) {
                 const refs = Array.from(referenceAnswerSpans)
@@ -1092,7 +1461,7 @@
             }
 
             if (!a) {
-                const answerTitleNode = block.querySelector('.analysis .answer-title, .answer-title');
+                const answerTitleNode = block.querySelector(SELECTORS.previewPage.answerTitle);
                 if (answerTitleNode) {
                     const titleText = normalizeLine(answerTitleNode.textContent || answerTitleNode.innerText || '');
                     const matched = titleText.match(/参考答案[:：]\s*(.+)$/);
@@ -1103,12 +1472,12 @@
             }
 
             if (!a) {
-                const aNode = block.querySelector('.correct-answer, .right-answer, .analysis-answer, .answer-content, .answer, .answer-text');
+                const aNode = block.querySelector(SELECTORS.previewPage.answerFallback);
                 a = aNode ? normalizeLine(aNode.textContent || aNode.innerText || '') : '';
             }
 
             if (!a) {
-                const checked = block.querySelectorAll('.is-checked, .checked, input:checked');
+                const checked = block.querySelectorAll(SELECTORS.previewPage.checkedFallback);
                 if (checked.length > 0) {
                     const labels = [];
                     checked.forEach(el => {
@@ -1119,8 +1488,8 @@
                 }
             }
 
-            const isErrorResult = !!block.querySelector('.question-result.error');
-            if (isErrorResult && !block.querySelector('.analysis .answer-title, .answer-title')) {
+            const isErrorResult = !!block.querySelector(SELECTORS.previewPage.errorResult);
+            if (isErrorResult && !block.querySelector(SELECTORS.previewPage.answerTitle)) {
                 // 错题且无参考答案时，不记录用户答案，防止污染记忆库
                 a = '';
             }
@@ -1140,56 +1509,85 @@
         goToCourseList('解析页采集完成，返回课程主页继续执行...');
     }
 
+    const routeHandlers = [
+        {
+            key: 'singleCourse',
+            match: '/singleCourse/',
+            onEnter: (url) => {
+                storage.setSession(KEYS.session.courseListUrl, url);
+            },
+            run: () => findAndScrollToIncompleteItem(),
+            onError: (err) => log(`singleCourse处理异常: ${err.message}`)
+        },
+        {
+            key: 'learnPage',
+            match: '/learnPage/',
+            run: () => handleLearnPage(),
+            onError: (err) => {
+                log(`learnPage处理异常: ${err.message}`);
+                goToCourseList('learnPage异常，回课程主页继续执行...');
+            }
+        },
+        {
+            key: 'masteryHistory',
+            match: '/masteryHistory/',
+            run: () => processMasteryHistory(),
+            onError: (err) => log(`masteryHistory处理异常: ${err.message}`)
+        },
+        {
+            key: 'reviewTest',
+            match: '/studentReviewTestOrExam/',
+            run: () => processTestPage(),
+            onError: (err) => log(`答题页处理异常: ${err.message}`)
+        },
+        {
+            key: 'point',
+            match: '/point/',
+            run: () => processPointPage(),
+            onError: (err) => {
+                log(`结算页处理异常: ${err.message}`);
+                goToCourseList('结算页异常，回课程主页继续执行...');
+            }
+        },
+        {
+            key: 'examPreview',
+            match: '/examPreview/',
+            run: () => processExamPreviewPage(),
+            onError: (err) => {
+                log(`解析页处理异常: ${err.message}`, 'error');
+                goToCourseList('解析页异常，回课程主页继续执行...');
+            }
+        }
+    ];
+
     function mainLoop() {
         if (!autoMode) return;
         const currentUrl = window.location.href;
-        
-        // 记录课程主列表URL
-        if (currentUrl.includes('/singleCourse/')) {
-            sessionStorage.setItem('course_list_url', currentUrl);
+
+        const matchedRoute = routeHandlers.find(route => currentUrl.includes(route.match));
+        if (matchedRoute) {
+            if (matchedRoute.onEnter) {
+                matchedRoute.onEnter(currentUrl);
+            }
+            matchedRoute.run().catch(matchedRoute.onError);
+            return;
         }
 
-        if (currentUrl.includes('/singleCourse/')) {
-            findAndScrollToIncompleteItem().catch(err => {
-                log(`singleCourse处理异常: ${err.message}`);
-            });
-        } else if (currentUrl.includes('/learnPage/')) {
-            handleLearnPage().catch(err => {
-                log(`learnPage处理异常: ${err.message}`);
-                goToCourseList('learnPage异常，回课程主页继续执行...');
-            });
-        } else if (currentUrl.includes('/masteryHistory/')) {
-            processMasteryHistory().catch(err => {
-                log(`masteryHistory处理异常: ${err.message}`);
-            });
-        } else if (currentUrl.includes('/studentReviewTestOrExam/')) {
-            processTestPage().catch(err => {
-                log(`答题页处理异常: ${err.message}`);
-            });
-        } else if (currentUrl.includes('/point/')) {
-            processPointPage().catch(err => {
-                log(`结算页处理异常: ${err.message}`);
-                goToCourseList('结算页异常，回课程主页继续执行...');
-            });
-        } else if (currentUrl.includes('/examPreview/')) {
-            processExamPreviewPage().catch(err => {
-                log(`解析页处理异常: ${err.message}`, 'error');
-                goToCourseList('解析页异常，回课程主页继续执行...');
-            });
-        } else if (currentUrl.includes('/mySpace/')) {
-            log("当前在 mySpace，请先手动进入某个课程的 singleCourse 页面。");
-        } else {
-            log("当前页面不在课程流程内，请手动进入 singleCourse 页面。");
+        if (currentUrl.includes('/mySpace/')) {
+            log('当前在 mySpace，请先手动进入某个课程的 singleCourse 页面。');
+            return;
         }
+
+        log('当前页面不在课程流程内，请手动进入 singleCourse 页面。');
     }
 
     function toggleAutoMode(start) {
         autoMode = start;
-        GM_setValue('autoMode_state', start);
+        storage.setGm(KEYS.gm.autoMode, start);
         if (autoMode) {
             clearLogBuffer();
             // 启动后不清空永久缓存，只重置本轮状态
-            sessionStorage.removeItem('last_attempted_item');
+            storage.removeSession(KEYS.session.lastAttemptedItem);
             
             startButton.textContent = '停止自动答题';
             startButton.style.backgroundColor = '#dc3545';
@@ -1235,3 +1633,4 @@
     }, false);
 
 })();
+}
