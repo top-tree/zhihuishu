@@ -25,6 +25,83 @@ const PureUtils = Object.freeze({
             .replace(/\s+/g, '')
             .replace(/[，。、“”‘’【】（）()《》：:；;,.!?！？'"`]/g, '');
     },
+    normalizeQuestionKey(text) {
+        const withoutNumber = String(text || '')
+            .replace(/^\s*(?:(?:第\s*)?[一二三四五六七八九十百千万\d]+(?:题|[、.．:：)\）]))\s*/, '');
+        return PureUtils.normalizeTextForMatch(withoutNumber);
+    },
+    normalizeQaRecord(item, fallbackUpdatedAt = Date.now()) {
+        const q = String(item?.q || '').replace(/\s+/g, ' ').trim();
+        const a = String(item?.a || '').replace(/\s+/g, ' ').trim();
+        if (!q || !a) return null;
+
+        const sourceUpdatedAt = Number(item?.updatedAt || 0);
+        const fallback = Number(fallbackUpdatedAt || Date.now());
+        return {
+            q,
+            a,
+            updatedAt: sourceUpdatedAt > 0 ? sourceUpdatedAt : fallback
+        };
+    },
+    mergeQaRecords(existingRecords = [], newRecords = [], updatedAt = Date.now()) {
+        const byQuestion = new Map();
+        const putRecord = (item, preferIncoming) => {
+            const normalized = PureUtils.normalizeQaRecord(item, preferIncoming ? updatedAt : item?.updatedAt);
+            if (!normalized) return;
+            const key = PureUtils.normalizeQuestionKey(normalized.q);
+            if (!key) return;
+
+            const current = byQuestion.get(key);
+            if (!current || preferIncoming || (normalized.updatedAt || 0) >= (current.updatedAt || 0)) {
+                byQuestion.set(key, normalized);
+            }
+        };
+
+        (Array.isArray(existingRecords) ? existingRecords : []).forEach(item => putRecord(item, false));
+        (Array.isArray(newRecords) ? newRecords : []).forEach(item => putRecord(item, true));
+
+        return Array.from(byQuestion.values())
+            .sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0));
+    },
+    scoreQaHint(item, currentQuestion) {
+        const currentKey = PureUtils.normalizeQuestionKey(currentQuestion || '');
+        const hintKey = PureUtils.normalizeQuestionKey(item?.q || '');
+        if (!currentKey || !hintKey) return 0;
+        if (currentKey === hintKey) return 100000;
+        if (currentKey.includes(hintKey) || hintKey.includes(currentKey)) {
+            return 80000 + Math.min(currentKey.length, hintKey.length);
+        }
+
+        const currentChars = new Set(currentKey.split(''));
+        const hintChars = new Set(hintKey.split(''));
+        let shared = 0;
+        hintChars.forEach(ch => {
+            if (currentChars.has(ch)) shared += 1;
+        });
+
+        const denominator = Math.max(currentChars.size, hintChars.size, 1);
+        const overlap = shared / denominator;
+        if (overlap < 0.15) return 0;
+        return Math.round(overlap * 10000);
+    },
+    rankQaHints(records = [], currentQuestion, maxItems = 8) {
+        const limit = Math.max(0, Number(maxItems || 0));
+        if (limit === 0) return [];
+
+        return (Array.isArray(records) ? records : [])
+            .map((item, index) => {
+                const normalized = PureUtils.normalizeQaRecord(item, item?.updatedAt);
+                return {
+                    item: normalized,
+                    index,
+                    score: normalized ? PureUtils.scoreQaHint(normalized, currentQuestion) : 0
+                };
+            })
+            .filter(entry => entry.item && entry.score > 0)
+            .sort((a, b) => b.score - a.score || (b.item.updatedAt || 0) - (a.item.updatedAt || 0) || a.index - b.index)
+            .slice(0, limit)
+            .map(entry => entry.item);
+    },
     previewText(text, maxLen = 60) {
         const s = String(text || '').replace(/\s+/g, ' ').trim();
         if (s.length <= maxLen) return s;
@@ -764,22 +841,41 @@ if (isBrowserRuntime) {
         storage.setGm(KEYS.gm.chapterQaMemory, memory || {});
     }
 
-    function replaceChapterQaRecords(chapterKey, records) {
-        if (!chapterKey) return 0;
+    function mergeChapterQaRecords(chapterKey, records) {
+        if (!chapterKey) return { added: 0, updated: 0, total: 0 };
         const memory = getChapterQaMemory();
-        const uniqMap = new Map();
+        const existingList = Array.isArray(memory[chapterKey]) ? memory[chapterKey] : [];
+        const beforeByKey = new Map();
+        const incomingByKey = new Map();
 
-        (records || []).forEach(item => {
-            const q = String(item?.q || '').replace(/\s+/g, ' ').trim();
-            const a = String(item?.a || '').replace(/\s+/g, ' ').trim();
-            if (!q || !a) return;
-            uniqMap.set(q, { q, a, updatedAt: Date.now() });
+        existingList.forEach(item => {
+            const normalized = PureUtils.normalizeQaRecord(item, item?.updatedAt);
+            const key = normalized ? PureUtils.normalizeQuestionKey(normalized.q) : '';
+            if (key) beforeByKey.set(key, normalized);
         });
 
-        const finalList = Array.from(uniqMap.values()).slice(-150);
-        memory[chapterKey] = finalList;
+        (Array.isArray(records) ? records : []).forEach(item => {
+            const normalized = PureUtils.normalizeQaRecord(item);
+            const key = normalized ? PureUtils.normalizeQuestionKey(normalized.q) : '';
+            if (key) incomingByKey.set(key, normalized);
+        });
+
+        const mergedList = PureUtils.mergeQaRecords(existingList, records, Date.now());
+        memory[chapterKey] = mergedList;
         saveChapterQaMemory(memory);
-        return finalList.length;
+
+        let added = 0;
+        let updated = 0;
+        incomingByKey.forEach((incoming, key) => {
+            const previous = beforeByKey.get(key);
+            if (!previous) {
+                added += 1;
+            } else if (previous.a !== incoming.a) {
+                updated += 1;
+            }
+        });
+
+        return { added, updated, total: mergedList.length };
     }
 
     function getChapterMemoryCount(chapterKey) {
@@ -794,24 +890,7 @@ if (isBrowserRuntime) {
         const memory = getChapterQaMemory();
         const list = Array.isArray(memory[chapterKey]) ? memory[chapterKey] : [];
         if (list.length === 0) return [];
-
-        const normalizedCurrent = PureUtils.normalizeTextForMatch(currentQuestion || '');
-        const scored = list.map(item => {
-            const nq = PureUtils.normalizeTextForMatch(item.q || '');
-            let score = 0;
-            if (normalizedCurrent && nq) {
-                if (normalizedCurrent.includes(nq) || nq.includes(normalizedCurrent)) {
-                    score += 5;
-                }
-                const sameChars = new Set(nq.split('')).size;
-                score += Math.min(3, sameChars > 0 ? Math.floor((nq.length && normalizedCurrent.length ? Math.min(nq.length, normalizedCurrent.length) : 0) / 20) : 0);
-            }
-            score += item.updatedAt ? 1 : 0;
-            return { item, score };
-        });
-
-        scored.sort((a, b) => b.score - a.score || (b.item.updatedAt || 0) - (a.item.updatedAt || 0));
-        return scored.slice(0, maxItems).map(x => x.item);
+        return PureUtils.rankQaHints(list, currentQuestion, maxItems);
     }
 
     function previewText(text, maxLen = 60) {
@@ -1643,8 +1722,8 @@ if (isBrowserRuntime) {
         });
 
         if (chapterKey && extractedRecords.length > 0) {
-            const savedCount = replaceChapterQaRecords(chapterKey, extractedRecords);
-            log(`已覆盖更新章节记忆库，共 ${savedCount} 条（旧记录已替换）。`, 'info');
+            const stats = mergeChapterQaRecords(chapterKey, extractedRecords);
+            log(`已合并章节记忆库，新增 ${stats.added} 条，更新 ${stats.updated} 条，累计 ${stats.total} 条。`, 'info');
         } else {
             log('未提取到有效题目答案记录（可能页面结构不同）。', 'warn');
         }
