@@ -102,6 +102,25 @@ const PureUtils = Object.freeze({
             .slice(0, limit)
             .map(entry => entry.item);
     },
+    findDirectQaHint(records = [], currentQuestion) {
+        const currentKey = PureUtils.normalizeQuestionKey(currentQuestion || '');
+        if (!currentKey) return null;
+
+        return (Array.isArray(records) ? records : []).find(item => {
+            const normalized = PureUtils.normalizeQaRecord(item, item?.updatedAt);
+            const hintKey = normalized ? PureUtils.normalizeQuestionKey(normalized.q) : '';
+            return hintKey && hintKey === currentKey;
+        }) || null;
+    },
+    getDirectHintAnswer(records = [], currentQuestion, options = [], type = '') {
+        const directHint = PureUtils.findDirectQaHint(records, currentQuestion);
+        if (!directHint) return null;
+
+        if (String(type || '').includes('填空')) {
+            return PureUtils.normalizeFillAnswerByQuestion(currentQuestion, directHint.a);
+        }
+        return PureUtils.parseChoiceAnswer(directHint.a, options, type);
+    },
     previewText(text, maxLen = 60) {
         const s = String(text || '').replace(/\s+/g, ' ').trim();
         if (s.length <= maxLen) return s;
@@ -149,12 +168,34 @@ const PureUtils = Object.freeze({
         text = text.replace(/\r?\n+/g, '||');
         return text || null;
     },
-    normalizeFillAnswerByQuestion(question, rawAnswer) {
-        const cleaned = PureUtils.parseFillAnswer(rawAnswer);
-        if (!cleaned) return null;
+    countFillBlanks(question) {
+        const matches = String(question || '').match(/_{2,}|[（(]\s*[）)]/g) || [];
+        return Math.max(1, matches.length);
+    },
+    splitFillAnswerParts(rawContent, expectedCount = 1) {
+        const cleaned = PureUtils.parseFillAnswer(rawContent);
+        if (!cleaned) return [];
 
-        const expected = Math.max(1, (String(question || '').match(/_{2,}|___|（\s*\)|\(\s*\)/g) || []).length);
-        const parts = cleaned.split('||').map(s => s.trim()).filter(Boolean);
+        let parts = cleaned.split('||').map(s => s.trim()).filter(Boolean);
+        const expected = Math.max(1, Number(expectedCount || 1));
+        if (expected > 1 && parts.length === 1) {
+            const separated = parts[0].split(/[\/／、;；]/).map(s => s.trim()).filter(Boolean);
+            if (separated.length > 1) {
+                parts = separated;
+            }
+        }
+        return parts;
+    },
+    prepareFillAnswersForInputs(answerText, inputCount = 1) {
+        const count = Math.max(1, Number(inputCount || 1));
+        const parts = PureUtils.splitFillAnswerParts(answerText, count);
+        if (parts.length === 0) return [];
+        if (count === 1) return [parts.join('/')];
+        return parts;
+    },
+    normalizeFillAnswerByQuestion(question, rawAnswer) {
+        const expected = PureUtils.countFillBlanks(question);
+        const parts = PureUtils.splitFillAnswerParts(rawAnswer, expected);
         if (parts.length === 0) return null;
 
         if (parts.length === expected) return parts.join('||');
@@ -1058,7 +1099,7 @@ if (isBrowserRuntime) {
     function buildAiMessages(question, options, type, safeMode = false, chapterHints = []) {
         const q = String(question || '').replace(/\s+/g, ' ').trim();
         const isFill = type.includes('填空');
-        const expectedFillCount = isFill ? Math.max(1, (q.match(/_{2,}|___|（\s*\)|\(\s*\)/g) || []).length) : 0;
+        const expectedFillCount = isFill ? PureUtils.countFillBlanks(q) : 0;
         const optionText = (options || [])
             .map((opt, i) => `${String.fromCharCode(65 + i)}. ${String(opt || '').replace(/\s+/g, ' ').trim()}`)
             .join('\n');
@@ -1197,6 +1238,12 @@ if (isBrowserRuntime) {
             });
         } else {
             log('当前题未命中历史参考。', 'debug', 'MEMORY');
+        }
+
+        const directHintAnswer = PureUtils.getDirectHintAnswer(chapterHints, question, options, type);
+        if (directHintAnswer) {
+            log(`完全命中历史参考，直接采用答案: ${previewText(directHintAnswer, 50)}`, 'info', 'MEMORY');
+            return directHintAnswer;
         }
 
         async function tryProvider(provider, attempts) {
@@ -1348,9 +1395,9 @@ if (isBrowserRuntime) {
             if (qTypeText.includes('填空')) {
                 const inputs = qContent.querySelectorAll(SELECTORS.testPage.fillInputs);
                 if (inputs.length === 0) return { status: 'none' };
-                const ansStr = await getAnswer(qTitle + ' (按顺序返回每空答案，多空用||分隔)', [], '填空题');
+                const ansStr = await getAnswer(qTitle, [], qTypeText);
                 if (!ansStr) return { status: 'none' };
-                const ansList = ansStr.split('||').map(s => s.trim());
+                const ansList = PureUtils.prepareFillAnswersForInputs(ansStr, inputs.length);
                 for (let round = 1; round <= 2; round++) {
                     for (let i = 0; i < inputs.length; i++) {
                         if (!ansList[i]) continue;
