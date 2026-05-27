@@ -28,7 +28,8 @@ const PureUtils = Object.freeze({
     normalizeQuestionKey(text) {
         const withoutNumber = String(text || '')
             .replace(/^\s*(?:(?:第\s*)?[一二三四五六七八九十百千万\d]+(?:题|[、.．:：)\）]))\s*/, '');
-        return PureUtils.normalizeTextForMatch(withoutNumber);
+        const normalizedBlanks = withoutNumber.replace(/_{2,}|[（(]\s*[）)]/g, '空');
+        return PureUtils.normalizeTextForMatch(normalizedBlanks);
     },
     normalizeQaRecord(item, fallbackUpdatedAt = Date.now()) {
         const q = String(item?.q || '').replace(/\s+/g, ' ').trim();
@@ -84,9 +85,13 @@ const PureUtils = Object.freeze({
         if (overlap < 0.15) return 0;
         return Math.round(overlap * 10000);
     },
-    rankQaHints(records = [], currentQuestion, maxItems = 8) {
+    getHintMinScore(type = '') {
+        return String(type || '').includes('填空') ? 100000 : 1;
+    },
+    rankQaHints(records = [], currentQuestion, maxItems = 8, options = {}) {
         const limit = Math.max(0, Number(maxItems || 0));
         if (limit === 0) return [];
+        const minScore = Math.max(0, Number(options?.minScore || 0));
 
         return (Array.isArray(records) ? records : [])
             .map((item, index) => {
@@ -97,7 +102,7 @@ const PureUtils = Object.freeze({
                     score: normalized ? PureUtils.scoreQaHint(normalized, currentQuestion) : 0
                 };
             })
-            .filter(entry => entry.item && entry.score > 0)
+            .filter(entry => entry.item && entry.score > 0 && entry.score >= minScore)
             .sort((a, b) => b.score - a.score || (b.item.updatedAt || 0) - (a.item.updatedAt || 0) || a.index - b.index)
             .slice(0, limit)
             .map(entry => entry.item);
@@ -926,12 +931,14 @@ if (isBrowserRuntime) {
         return list.length;
     }
 
-    function getChapterQaHints(chapterKey, currentQuestion, maxItems = 8) {
+    function getChapterQaHints(chapterKey, currentQuestion, maxItems = 8, type = '') {
         if (!chapterKey) return [];
         const memory = getChapterQaMemory();
         const list = Array.isArray(memory[chapterKey]) ? memory[chapterKey] : [];
         if (list.length === 0) return [];
-        return PureUtils.rankQaHints(list, currentQuestion, maxItems);
+        return PureUtils.rankQaHints(list, currentQuestion, maxItems, {
+            minScore: PureUtils.getHintMinScore(type)
+        });
     }
 
     function previewText(text, maxLen = 60) {
@@ -1230,7 +1237,7 @@ if (isBrowserRuntime) {
     async function getAnswer(question, options, type) {
         const chapterKey = getCurrentChapterKey();
         log(`当前章节: ${chapterKey || '(空)'}`, 'debug', 'MEMORY');
-        const chapterHints = getChapterQaHints(chapterKey, question, 8);
+        const chapterHints = getChapterQaHints(chapterKey, question, 8, type);
         if (chapterHints.length > 0) {
             log(`注入历史参考 ${chapterHints.length} 条。`, 'debug', 'MEMORY');
             chapterHints.forEach((h, idx) => {
