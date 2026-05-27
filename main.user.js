@@ -26,7 +26,10 @@ const PureUtils = Object.freeze({
             .replace(/[，。、“”‘’【】（）()《》：:；;,.!?！？'"`]/g, '');
     },
     normalizeQuestionKey(text) {
-        const withoutNumber = String(text || '')
+        const raw = String(text || '');
+        const previewLike = /回答正确|回答错误|参考答案|答案解析|AI答题辅导|收藏为薄弱题|\(\s*\d+\s*\)|单选题|多选题|判断题|填空客观题/.test(raw);
+        const source = previewLike ? PureUtils.cleanPreviewQuestionText(raw) : raw;
+        const withoutNumber = source
             .replace(/^\s*(?:(?:第\s*)?[一二三四五六七八九十百千万\d]+(?:题|[、.．:：)\）]))\s*/, '');
         const normalizedBlanks = withoutNumber.replace(/_{2,}|[（(]\s*[）)]/g, '空');
         return PureUtils.normalizeTextForMatch(normalizedBlanks);
@@ -43,6 +46,72 @@ const PureUtils = Object.freeze({
             a,
             updatedAt: sourceUpdatedAt > 0 ? sourceUpdatedAt : fallback
         };
+    },
+    cleanPreviewQuestionText(text) {
+        let cleaned = String(text || '').replace(/\s+/g, ' ').trim();
+        if (!cleaned) return '';
+
+        const stopPatterns = [
+            /\(\s*\d+\s*\)/,
+            /回答正确/,
+            /回答错误/,
+            /参考答案/,
+            /答案解析/,
+            /AI答题辅导/,
+            /收藏为薄弱题/,
+            /🥳/,
+            /😔/
+        ];
+        let stopIndex = -1;
+        stopPatterns.forEach(pattern => {
+            const matched = cleaned.match(pattern);
+            if (matched && matched.index !== undefined) {
+                stopIndex = stopIndex < 0 ? matched.index : Math.min(stopIndex, matched.index);
+            }
+        });
+        if (stopIndex >= 0) {
+            cleaned = cleaned.slice(0, stopIndex).trim();
+        }
+
+        let previous = '';
+        while (previous !== cleaned) {
+            previous = cleaned;
+            cleaned = cleaned
+                .replace(/^\s*(?:单选题|多选题|判断题|填空客观题（自动批阅）|填空客观题|填空题)\s*/, '')
+                .replace(/^\s*\d+[、.．]\s*/, '')
+                .trim();
+        }
+        return cleaned;
+    },
+    cleanPreviewAnswerText(text) {
+        let cleaned = String(text || '').replace(/\s+/g, ' ').trim();
+        if (!cleaned) return '';
+
+        const matched = cleaned.match(/(?:参考答案|正确答案|答案)[:：]\s*(.*)$/);
+        if (matched) {
+            cleaned = matched[1].trim();
+        }
+
+        const stopPatterns = [
+            /答案解析/,
+            /AI答题辅导/,
+            /收藏为薄弱题/,
+            /回答正确/,
+            /回答错误/,
+            /🥳/,
+            /😔/
+        ];
+        let stopIndex = -1;
+        stopPatterns.forEach(pattern => {
+            const match = cleaned.match(pattern);
+            if (match && match.index !== undefined) {
+                stopIndex = stopIndex < 0 ? match.index : Math.min(stopIndex, match.index);
+            }
+        });
+        if (stopIndex >= 0) {
+            cleaned = cleaned.slice(0, stopIndex).trim();
+        }
+        return cleaned;
     },
     mergeQaRecords(existingRecords = [], newRecords = [], updatedAt = Date.now()) {
         const byQuestion = new Map();
@@ -1718,18 +1787,17 @@ if (isBrowserRuntime) {
         const extractedRecords = [];
 
         const normalizeLine = (s) => String(s || '').replace(/\s+/g, ' ').trim();
-        const cleanQuestion = (s) => normalizeLine(s).replace(/^\d+[、.．]\s*/, '');
 
         questionBlocks.forEach(block => {
             const qNode = block.querySelector(SELECTORS.previewPage.questionTitle);
-            const q = qNode ? cleanQuestion(qNode.textContent || qNode.innerText || '') : '';
+            const q = qNode ? PureUtils.cleanPreviewQuestionText(qNode.textContent || qNode.innerText || '') : '';
 
             // 优先提取“参考答案”，避免把用户错误作答写入记忆库
             const referenceAnswerSpans = block.querySelectorAll(SELECTORS.previewPage.referenceAnswerSpans);
             let a = '';
             if (referenceAnswerSpans.length > 0) {
                 const refs = Array.from(referenceAnswerSpans)
-                    .map(el => normalizeLine(el.textContent || el.innerText || ''))
+                    .map(el => PureUtils.cleanPreviewAnswerText(el.textContent || el.innerText || ''))
                     .filter(Boolean);
                 if (refs.length > 0) {
                     a = refs.join('||');
@@ -1739,17 +1807,13 @@ if (isBrowserRuntime) {
             if (!a) {
                 const answerTitleNode = block.querySelector(SELECTORS.previewPage.answerTitle);
                 if (answerTitleNode) {
-                    const titleText = normalizeLine(answerTitleNode.textContent || answerTitleNode.innerText || '');
-                    const matched = titleText.match(/参考答案[:：]\s*(.+)$/);
-                    if (matched && matched[1]) {
-                        a = normalizeLine(matched[1]);
-                    }
+                    a = PureUtils.cleanPreviewAnswerText(answerTitleNode.textContent || answerTitleNode.innerText || '');
                 }
             }
 
             if (!a) {
                 const aNode = block.querySelector(SELECTORS.previewPage.answerFallback);
-                a = aNode ? normalizeLine(aNode.textContent || aNode.innerText || '') : '';
+                a = aNode ? PureUtils.cleanPreviewAnswerText(aNode.textContent || aNode.innerText || '') : '';
             }
 
             if (!a) {
